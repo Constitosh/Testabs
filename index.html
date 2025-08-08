@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>$TEST Wallet Checker</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      background: #0b0b0c;
+      font-family: "Segoe UI", sans-serif;
+      color: #eaeaea;
+      padding: 1rem;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    h1 { color: #00ff9c; margin: 0.5rem 0; }
+    h2 { margin: 0 0 1.5rem 0; font-weight: 500; }
+    #addr {
+      padding: 0.75rem;
+      width: 100%;
+      max-width: 460px;
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      background: #111;
+      color: #fff;
+      margin-bottom: 1rem;
+    }
+    button {
+      background: #00ff9c;
+      color: black;
+      font-weight: 600;
+      padding: 0.7rem 1.5rem;
+      border: none;
+      border-radius: 8px;
+      margin: 0.3rem;
+      cursor: pointer;
+      transition: background 0.2s ease;
+    }
+    button:hover { background: #00cc7a; }
+    .summary, .table-container {
+      display: none;
+      width: 100%;
+      max-width: 960px;
+      background: #1a1a1c;
+      border: 1px solid #2e2e33;
+      border-radius: 12px;
+      padding: 1.2rem;
+      margin-bottom: 2rem;
+    }
+    .summary.show, .table-container.show { display: block; }
+    .summary-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1rem;
+    }
+    .summary-header h3 { margin: 0; font-size: 1rem; color: #bbb; }
+    .summary-content {
+      display: flex;
+      gap: 2rem;
+      flex-wrap: wrap;
+    }
+    .summary-content div { font-size: 0.95rem; }
+    .profit { color: #00ff9c; }
+    .loss { color: #ff4e4e; }
+    a.etherscan-link {
+      color: #00ff9c;
+      font-size: 0.85rem;
+      text-decoration: none;
+    }
+    .section-title {
+      font-size: 1rem;
+      text-align: left;
+      margin: 1rem 0 0.5rem;
+      padding-left: 0.5rem;
+      color: #ccc;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th, td {
+      padding: 0.8rem;
+      text-align: left;
+      border-bottom: 1px solid #333;
+    }
+    th { background: #222; color: #ccc; font-weight: 600; }
+    td { color: #ddd; font-size: 0.9rem; }
+    img.token-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+    @media (max-width: 768px) {
+      th, td { font-size: 0.8rem; padding: 0.5rem; }
+    }
+  </style>
+</head>
+<body>
+  <h1>$TEST</h1>
+  <h2>Wallet Checker</h2>
+  <input id="addr" placeholder="Paste your Abstract wallet address in here" />
+  <div>
+    <button onclick="fetchPNL()">Wallet PNL 📊</button>
+    <button onclick="toggleView('open')">Open Positions</button>
+  </div>
+  <div id="wallet-summary" class="summary"></div>
+  <div id="top-pnl" class="table-container"></div>
+  <div id="token-table" class="table-container"></div>
+
+  <script>
+    const iconCache = {};
+    async function getTokenIcon(tokenAddress) {
+      if (!tokenAddress) return null;
+      if (iconCache[tokenAddress]) return iconCache[tokenAddress];
+      try {
+        const res = await fetch(`https://api.dexscreener.com/tokens/v1/abstract/${tokenAddress}`);
+        const data = await res.json();
+        if (Array.isArray(data) && data.length > 0 && data[0]?.info?.imageUrl) {
+          const imageUrl = data[0].info.imageUrl;
+          iconCache[tokenAddress] = imageUrl;
+          return imageUrl;
+        }
+      } catch (e) {
+        console.error("Icon fetch error for", tokenAddress, e);
+      }
+      return null;
+    }
+
+    let tokenData = [];
+
+    async function fetchPNL() {
+      const addr = document.getElementById('addr').value.trim();
+      if (!addr || !/^0x[a-fA-F0-9]{40}$/.test(addr)) {
+        alert('Invalid address.');
+        return;
+      }
+      document.querySelectorAll('.summary, .table-container').forEach(e => e.classList.remove('show'));
+      try {
+        const res = await fetch(`/api/pnl?address=${addr}`);
+        const data = await res.json();
+        tokenData = data.filter(t => t.totalBuyETH > 0 || t.totalSellETH > 0);
+
+        let totalBuy = 0, totalSell = 0, totalPNL = 0;
+        tokenData.forEach(t => {
+          totalBuy += t.totalBuyETH;
+          totalSell += t.totalSellETH;
+          totalPNL += t.pnl;
+        });
+
+        const netPct = totalBuy > 0 ? (totalPNL / totalBuy) * 100 : 0;
+        const netClass = totalPNL >= 0 ? 'profit' : 'loss';
+
+        document.getElementById('wallet-summary').innerHTML = `
+          <div class="summary-header">
+            <h3>Wallet Summary</h3>
+            <a class="etherscan-link" href="https://explorer.mainnet.abs.xyz/address/${addr}" target="_blank">View on AbstractScan ↗</a>
+          </div>
+          <div class="summary-content">
+            <div>Total Buy: ${totalBuy.toFixed(4)} ETH</div>
+            <div>Total Sell: ${totalSell.toFixed(4)} ETH</div>
+            <div class="${netClass}">Net PNL: ${totalPNL.toFixed(4)} ETH (${netPct.toFixed(2)}%)</div>
+            <button onclick="downloadCSV()">Download CSV ⬇️</button>
+          </div>`;
+        document.getElementById('wallet-summary').classList.add('show');
+
+        showTopPNL();
+      } catch (err) {
+        console.error('Fetch error:', err);
+        document.getElementById('wallet-summary').innerText = 'Error loading data.';
+      }
+    }
+
+    function toggleView(type) {
+      document.getElementById('top-pnl').classList.remove('show');
+      document.getElementById('token-table').classList.remove('show');
+      if (type === 'open') {
+        showOpenPositions();
+      } else {
+        showTopPNL();
+      }
+    }
+
+    async function showTopPNL() {
+      const sorted = tokenData.slice().sort((a, b) => b.pnl - a.pnl);
+      const closed = sorted.filter(t => Math.abs(t.totalTokensBought - t.totalTokensSold) <= 1025);
+      const topGains = closed.filter(t => t.pnl > 0).slice(0, 5);
+      const topLosses = closed.filter(t => t.pnl < 0).sort((a, b) => a.pnl - b.pnl).slice(0, 5);
+
+      const renderTable = async (title, tokens) => {
+        if (!tokens.length) return '';
+        const rows = await Promise.all(tokens.map(async t => {
+          const icon = await getTokenIcon(t.tokenAddress);
+          const iconHTML = icon ? `<img src="${icon}" class="token-icon"/>` : '';
+          const pnlClass = t.pnl >= 0 ? 'profit' : 'loss';
+          return `<tr><td>${iconHTML}${t.token}</td><td>${t.totalBuyETH.toFixed(4)} ETH</td><td>${t.totalSellETH.toFixed(4)} ETH</td><td class="${pnlClass}">${t.pnl.toFixed(4)} ETH (${t.pct.toFixed(2)}%)</td></tr>`;
+        }));
+        return `<div class="section-title">${title}</div>
+          <table><thead><tr><th>Token</th><th>Total Buy</th><th>Total Sell</th><th>Net PNL</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+      };
+
+      const gainsHTML = await renderTable('Top 5 Gains', topGains);
+      const lossesHTML = await renderTable('Top 5 Losses', topLosses);
+      document.getElementById('top-pnl').innerHTML = gainsHTML + lossesHTML;
+      document.getElementById('top-pnl').classList.add('show');
+    }
+
+    async function showOpenPositions() {
+      const open = tokenData.filter(t => (t.totalTokensBought - t.totalTokensSold) > 1025);
+      const rows = await Promise.all(open.map(async t => {
+        const icon = await getTokenIcon(t.tokenAddress);
+        const iconHTML = icon ? `<img src="${icon}" class="token-icon"/>` : '';
+        const breakEven = (t.totalBuyETH - t.totalSellETH);
+        return `<tr><td>${iconHTML}${t.token}</td><td>${t.totalTokensBought.toFixed(2)}</td><td>${t.totalTokensSold.toFixed(2)}</td><td>${t.totalBuyETH.toFixed(4)} ETH</td><td>${t.totalSellETH.toFixed(4)} ETH</td><td class="loss">${t.pnl.toFixed(4)} ETH (${t.pct.toFixed(2)}%)</td><td>${breakEven.toFixed(4)} ETH</td></tr>`;
+      }));
+      document.getElementById('token-table').innerHTML = `
+        <div class="section-title">Open Positions</div>
+        <table><thead><tr><th>Token</th><th>Bought</th><th>Sold</th><th>Total Buy</th><th>Total Sell</th><th>Net PNL</th><th>Break-even</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+      document.getElementById('token-table').classList.add('show');
+    }
+
+    function downloadCSV() {
+      if (!tokenData.length) return;
+      const rows = [
+        ['Token', 'Tokens Bought', 'Tokens Sold', 'Total Buy (ETH)', 'Total Sell (ETH)', 'PNL (ETH)', 'PNL %'],
+        ...tokenData.map(t => [
+          t.token,
+          t.totalTokensBought.toFixed(2),
+          t.totalTokensSold.toFixed(2),
+          t.totalBuyETH.toFixed(4),
+          t.totalSellETH.toFixed(4),
+          t.pnl.toFixed(4),
+          `${t.pct.toFixed(2)}%`
+        ])
+      ];
+      const csvContent = "data:text/csv;charset=utf-8," + rows.map(e => e.join(",")).join("\n");
+      const link = document.createElement("a");
+      link.setAttribute("href", encodeURI(csvContent));
+      link.setAttribute("download", "wallet_pnl.csv");
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+  </script>
+</body>
+</html>
