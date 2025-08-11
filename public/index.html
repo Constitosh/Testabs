@@ -97,7 +97,7 @@
       margin-right: 6px; vertical-align: middle;
     }
 
-    /* banner + bottom note placeholders */
+    /* banner + bottom notes placeholders */
     #top-banner { min-height: 72px; display: flex; align-items: center; justify-content: center; }
     #top-banner em, #bottom-notes em { color: #bbb; }
     #bottom-notes { min-height: 120px; }
@@ -124,21 +124,21 @@
     <button onclick="onShowBubble()">Bubble Map 🫧</button>
   </div>
 
-  <!-- Wallet address input + buttons (existing) -->
+  <!-- Wallet address input + buttons -->
   <input id="addr" placeholder="Paste your Abstract wallet address in here" />
   <div>
     <button onclick="fetchPNL()">Wallet PNL 📊</button>
     <button onclick="toggleView('open')">Open Positions</button>
   </div>
 
-  <!-- Bubble map placeholder (pair info + canvas) -->
+  <!-- Bubble map containers (hidden until used) -->
   <div id="pair-info" class="table-container show" style="display:none;"></div>
   <div id="bubble-map" class="table-container" style="display:none;">
     <div class="section-title">Holders Bubble Map</div>
-    <!-- The SVG and stats will be injected here by your bubble script -->
+    <!-- SVG + stats injected by abs-bundle-bubble-viewer.js -->
   </div>
 
-  <!-- Existing PNL sections -->
+  <!-- PNL sections -->
   <div id="wallet-summary" class="summary"></div>
   <div id="top-pnl" class="table-container"></div>
   <div id="token-table" class="table-container"></div>
@@ -148,34 +148,33 @@
     <em>Bottom text placeholder — click here and start typing your notes.</em>
   </div>
 
-  <!-- (Optional) D3 for the bubble map script -->
+  <!-- D3 for bubble viewer -->
   <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <!-- Your bubble viewer (public/js/abs-bundle-bubble-viewer.js) -->
+  <script src="/js/abs-bundle-bubble-viewer.js"></script>
 
   <script>
-    // ---------- Placeholder glue for bubble button ----------
+    // ---------- Bubble button glue ----------
     function onShowBubble() {
       const ca = (document.getElementById('tokenAddr').value || '').trim();
       if (!/^0x[a-fA-F0-9]{40}$/.test(ca)) {
         alert('Invalid contract address.');
         return;
       }
-      // reveal containers
       document.getElementById('pair-info').style.display = 'block';
       document.getElementById('bubble-map').style.display = 'block';
 
-      // if your bubble script is loaded, call it
       if (typeof showTokenHolders === 'function') {
-        showTokenHolders();
+        showTokenHolders(); // defined in abs-bundle-bubble-viewer.js
       } else {
-        // placeholder content
         document.getElementById('pair-info').innerHTML =
-          '<span style="color:#bbb">Bubble map script not loaded yet. Include abs-bundle-bubble-viewer.js and try again.</span>';
+          '<span style="color:#bbb">Bubble map script not loaded yet. Check /js/abs-bundle-bubble-viewer.js</span>';
         document.getElementById('bubble-map').innerHTML =
           '<div class="section-title">Holders Bubble Map</div><p style="color:#bbb;padding:0 0.5rem">Waiting for bubble script…</p>';
       }
     }
 
-    // ---------- Existing PNL code (unchanged) ----------
+    // ---------- Existing PNL logic ----------
     const iconCache = {};
     async function getTokenIcon(tokenAddress) {
       if (!tokenAddress) return null;
