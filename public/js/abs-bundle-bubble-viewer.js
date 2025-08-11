@@ -33,6 +33,81 @@
     "0x000000000000000000000000000000000000dead"
   ]);
 
+/* ---------- First 20 buyers: dots + legend ---------- */
+
+// Colors (keep in sync with your bubble colors)
+const STATUS_COLORS = {
+  hold:    '#12d67a', // green
+  soldPart:'#3aa0ff', // blue
+  soldAll: '#ff5252', // red
+  more:    '#ffd34d'  // yellow (bought more)
+};
+
+function ensureFirst20Styles(){
+  if (document.getElementById('first20-dot-styles')) return;
+  const css = `
+    .first20-row { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
+    .first20-label { color:#bbb; font-size:.95rem; margin-right:.25rem; }
+    .dot { width:10px; height:10px; border-radius:50%; display:inline-block; cursor:pointer; }
+    .legend { display:flex; align-items:center; gap:14px; margin-top:.5rem; flex-wrap:wrap; opacity:.9; }
+    .legend .item { display:inline-flex; align-items:center; gap:6px; font-size:.85rem; color:#ccc; }
+  `;
+  const style = document.createElement('style');
+  style.id = 'first20-dot-styles';
+  style.textContent = css;
+  document.head.appendChild(style);
+}
+
+function openAddressOnExplorer(addr){
+  // Using AbstractScan to match your app
+  window.open(`https://explorer.mainnet.abs.xyz/address/${addr}`, '_blank');
+}
+
+function renderFirst20BuyersDots(containerEl, buyersArray){
+  ensureFirst20Styles();
+  if (!containerEl) return;
+
+  // buyersArray shape: [{ address:'0x..', status:'hold'|'soldPart'|'soldAll'|'more' }]
+  const row = document.createElement('div');
+  row.className = 'first20-row';
+
+  const label = document.createElement('div');
+  label.className = 'first20-label';
+  label.textContent = 'First 20 buyers:';
+  row.appendChild(label);
+
+  buyersArray.forEach(b => {
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    dot.style.background = STATUS_COLORS[b.status] || '#888';
+    // nice tooltip on hover – no text rendered inline
+    const statusText =
+      b.status === 'hold' ? 'Hold' :
+      b.status === 'soldPart' ? 'Sold Part' :
+      b.status === 'soldAll' ? 'Sold All' :
+      b.status === 'more' ? 'Bought More' : 'Unknown';
+    dot.title = `${b.address.slice(0,6)}…${b.address.slice(-4)} — ${statusText}`;
+    dot.onclick = () => openAddressOnExplorer(b.address);
+    row.appendChild(dot);
+  });
+
+  const legend = document.createElement('div');
+  legend.className = 'legend';
+  legend.innerHTML = `
+    <div class="item"><span class="dot" style="background:${STATUS_COLORS.hold}"></span> Hold</div>
+    <div class="item"><span class="dot" style="background:${STATUS_COLORS.soldPart}"></span> Sold Part</div>
+    <div class="item"><span class="dot" style="background:${STATUS_COLORS.soldAll}"></span> Sold All</div>
+    <div class="item"><span class="dot" style="background:${STATUS_COLORS.more}"></span> Bought More</div>
+  `;
+
+  containerEl.innerHTML = '';
+  containerEl.appendChild(row);
+  containerEl.appendChild(legend);
+}
+/* ---------------------------------------------------- */
+
+
+  
   // === Public entry point ===
   window.showTokenHolders = async function showTokenHolders() {
     const contractEl = document.getElementById('tokenAddr');
@@ -183,18 +258,17 @@
       const bundlesAggregatePct = totalSupply ? (bundlesAggregateTokens / totalSupply) * 100 : 0;
 
       // 8) First 20 buyers status + <10 count
-      const first20Enriched = first20.map(b => {
-        const dec = parseInt(b.tokenDecimal) || 18;
-        const addr = (b.to || b.toAddress).toLowerCase();
-        const init = parseFloat(b.value) / Math.pow(10, dec);
-        const current = (balances[addr] || 0);
-        const boughtMore = current > init * 1.05;
-        const soldAll   = current <= 1e-9;
-        const soldPart  = !soldAll && current < init * 0.95;
-        const status = boughtMore ? 'yellow' : soldAll ? 'red' : soldPart ? 'blue' : 'green';
-        return { address: addr, init, current, transfers: tokenTxCount[addr] || 0, status };
-      });
-      const lt10Count = first20Enriched.filter(b => b.transfers < 10).length;
+// after you computed the statuses for the first 20 buyers:
+const first20Statuses = first20Buyers.map(b => ({
+  address: b.address,
+  // map your internal flags to one of: 'hold' | 'soldPart' | 'soldAll' | 'more'
+  status: b.status   // <-- keep this as the exact string above
+}));
+
+// render as dots + legend (no addresses shown inline)
+const first20Container = document.getElementById('first20'); // you added this in index.html
+renderFirst20BuyersDots(first20Container, first20Statuses);
+
 
       // 9) Stats & render
       const holdersWithPct = holders.map(h => ({ ...h, pct: totalSupply ? (h.balance / totalSupply) * 100 : 0 }));
