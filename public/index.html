@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -19,7 +18,9 @@
     }
     h1 { color: #00ff9c; margin: 0.5rem 0; }
     h2 { margin: 0 0 1.5rem 0; font-weight: 500; }
-    #addr {
+
+    /* inputs */
+    #addr, #tokenAddr {
       padding: 0.75rem;
       width: 100%;
       max-width: 460px;
@@ -29,6 +30,7 @@
       color: #fff;
       margin-bottom: 1rem;
     }
+
     button {
       background: #00ff9c;
       color: black;
@@ -41,6 +43,8 @@
       transition: background 0.2s ease;
     }
     button:hover { background: #00cc7a; }
+
+    /* containers */
     .summary, .table-container {
       display: none;
       width: 100%;
@@ -52,6 +56,7 @@
       margin-bottom: 2rem;
     }
     .summary.show, .table-container.show { display: block; }
+
     .summary-header {
       display: flex;
       justify-content: space-between;
@@ -79,10 +84,7 @@
       padding-left: 0.5rem;
       color: #ccc;
     }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
+    table { width: 100%; border-collapse: collapse; }
     th, td {
       padding: 0.8rem;
       text-align: left;
@@ -91,30 +93,89 @@
     th { background: #222; color: #ccc; font-weight: 600; }
     td { color: #ddd; font-size: 0.9rem; }
     img.token-icon {
-      width: 32px;
-      height: 32px;
-      border-radius: 50%;
-      margin-right: 6px;
-      vertical-align: middle;
+      width: 32px; height: 32px; border-radius: 50%;
+      margin-right: 6px; vertical-align: middle;
     }
+
+    /* banner + bottom note placeholders */
+    #top-banner { min-height: 72px; display: flex; align-items: center; justify-content: center; }
+    #top-banner em, #bottom-notes em { color: #bbb; }
+    #bottom-notes { min-height: 120px; }
+    #bottom-notes[contenteditable="true"] { outline: none; }
+
     @media (max-width: 768px) {
       th, td { font-size: 0.8rem; padding: 0.5rem; }
     }
   </style>
 </head>
 <body>
+
+  <!-- Banner placeholder -->
+  <div id="top-banner" class="table-container show">
+    <em>Banner placeholder — add your promo or message here</em>
+  </div>
+
   <h1>$TEST</h1>
   <h2>Wallet Checker</h2>
+
+  <!-- Token CA input + bubble map button -->
+  <input id="tokenAddr" placeholder="Paste token contract address for Bubble Map" />
+  <div>
+    <button onclick="onShowBubble()">Bubble Map 🫧</button>
+  </div>
+
+  <!-- Wallet address input + buttons (existing) -->
   <input id="addr" placeholder="Paste your Abstract wallet address in here" />
   <div>
     <button onclick="fetchPNL()">Wallet PNL 📊</button>
     <button onclick="toggleView('open')">Open Positions</button>
   </div>
+
+  <!-- Bubble map placeholder (pair info + canvas) -->
+  <div id="pair-info" class="table-container show" style="display:none;"></div>
+  <div id="bubble-map" class="table-container" style="display:none;">
+    <div class="section-title">Holders Bubble Map</div>
+    <!-- The SVG and stats will be injected here by your bubble script -->
+  </div>
+
+  <!-- Existing PNL sections -->
   <div id="wallet-summary" class="summary"></div>
   <div id="top-pnl" class="table-container"></div>
   <div id="token-table" class="table-container"></div>
 
+  <!-- Bottom text area placeholder -->
+  <div id="bottom-notes" class="table-container show" contenteditable="true">
+    <em>Bottom text placeholder — click here and start typing your notes.</em>
+  </div>
+
+  <!-- (Optional) D3 for the bubble map script -->
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+
   <script>
+    // ---------- Placeholder glue for bubble button ----------
+    function onShowBubble() {
+      const ca = (document.getElementById('tokenAddr').value || '').trim();
+      if (!/^0x[a-fA-F0-9]{40}$/.test(ca)) {
+        alert('Invalid contract address.');
+        return;
+      }
+      // reveal containers
+      document.getElementById('pair-info').style.display = 'block';
+      document.getElementById('bubble-map').style.display = 'block';
+
+      // if your bubble script is loaded, call it
+      if (typeof showTokenHolders === 'function') {
+        showTokenHolders();
+      } else {
+        // placeholder content
+        document.getElementById('pair-info').innerHTML =
+          '<span style="color:#bbb">Bubble map script not loaded yet. Include abs-bundle-bubble-viewer.js and try again.</span>';
+        document.getElementById('bubble-map').innerHTML =
+          '<div class="section-title">Holders Bubble Map</div><p style="color:#bbb;padding:0 0.5rem">Waiting for bubble script…</p>';
+      }
+    }
+
+    // ---------- Existing PNL code (unchanged) ----------
     const iconCache = {};
     async function getTokenIcon(tokenAddress) {
       if (!tokenAddress) return null;
@@ -127,9 +188,7 @@
           iconCache[tokenAddress] = imageUrl;
           return imageUrl;
         }
-      } catch (e) {
-        console.error("Icon fetch error for", tokenAddress, e);
-      }
+      } catch (e) { console.error("Icon fetch error for", tokenAddress, e); }
       return null;
     }
 
@@ -141,18 +200,17 @@
         alert('Invalid address.');
         return;
       }
-      document.querySelectorAll('.summary, .table-container').forEach(e => e.classList.remove('show'));
+      document.querySelectorAll('.summary, .table-container').forEach(e => {
+        if (e.id !== 'top-banner' && e.id !== 'bottom-notes') e.classList.remove('show');
+      });
+
       try {
         const res = await fetch(`/api/pnl?address=${addr}`);
         const data = await res.json();
         tokenData = data.filter(t => t.totalBuyETH > 0 || t.totalSellETH > 0);
 
         let totalBuy = 0, totalSell = 0, totalPNL = 0;
-        tokenData.forEach(t => {
-          totalBuy += t.totalBuyETH;
-          totalSell += t.totalSellETH;
-          totalPNL += t.pnl;
-        });
+        tokenData.forEach(t => { totalBuy += t.totalBuyETH; totalSell += t.totalSellETH; totalPNL += t.pnl; });
 
         const netPct = totalBuy > 0 ? (totalPNL / totalBuy) * 100 : 0;
         const netClass = totalPNL >= 0 ? 'profit' : 'loss';
@@ -169,7 +227,6 @@
             <button onclick="downloadCSV()">Download CSV ⬇️</button>
           </div>`;
         document.getElementById('wallet-summary').classList.add('show');
-
         showTopPNL();
       } catch (err) {
         console.error('Fetch error:', err);
@@ -180,11 +237,7 @@
     function toggleView(type) {
       document.getElementById('top-pnl').classList.remove('show');
       document.getElementById('token-table').classList.remove('show');
-      if (type === 'open') {
-        showOpenPositions();
-      } else {
-        showTopPNL();
-      }
+      if (type === 'open') showOpenPositions(); else showTopPNL();
     }
 
     async function showTopPNL() {
