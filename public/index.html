@@ -106,13 +106,20 @@
     @media (max-width: 768px) {
       th, td { font-size: 0.8rem; padding: 0.5rem; }
     }
+
+  .first20-row { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; }
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; cursor:pointer; }
+  .dot-wrap { display:inline-flex; align-items:center; gap:6px; }
+  .legend { display:flex; align-items:center; gap:14px; margin-top:.5rem; flex-wrap:wrap; opacity:.9;}
+  .legend .item { display:inline-flex; align-items:center; gap:6px; font-size:.85rem; color:#ccc; }
+
   </style>
 </head>
 <body>
 
   <!-- Banner placeholder -->
   <div id="top-banner" class="table-container show">
-    <em>Banner placeholder — add your promo or message here</em>
+    <em>You place to check Abstract Tokens...try it</em>
   </div>
 
   <h1>$TEST</h1>
@@ -145,7 +152,7 @@
 
   <!-- Bottom text area placeholder -->
   <div id="bottom-notes" class="table-container show" contenteditable="true">
-    <em>Bottom text placeholder — click here and start typing your notes.</em>
+    <em>by The Totally Experimental Shit Token Team 21025 // check http://www.twitter.com/TotallyAbs for more</em>
   </div>
 
   <!-- D3 for bubble viewer -->
@@ -242,8 +249,8 @@
     async function showTopPNL() {
       const sorted = tokenData.slice().sort((a, b) => b.pnl - a.pnl);
       const closed = sorted.filter(t => Math.abs(t.totalTokensBought - t.totalTokensSold) <= 1025);
-      const topGains = closed.filter(t => t.pnl > 0).slice(0, 5);
-      const topLosses = closed.filter(t => t.pnl < 0).sort((a, b) => a.pnl - b.pnl).slice(0, 5);
+      const topGains = closed.filter(t => t.pnl > 0).slice(0, 15);
+      const topLosses = closed.filter(t => t.pnl < 0).sort((a, b) => a.pnl - b.pnl).slice(0, 15);
 
       const renderTable = async (title, tokens) => {
         if (!tokens.length) return '';
@@ -257,8 +264,8 @@
           <table><thead><tr><th>Token</th><th>Total Buy</th><th>Total Sell</th><th>Net PNL</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
       };
 
-      const gainsHTML = await renderTable('Top 5 Gains', topGains);
-      const lossesHTML = await renderTable('Top 5 Losses', topLosses);
+      const gainsHTML = await renderTable('Top 15 Gains', topGains);
+      const lossesHTML = await renderTable('Top 15 Losses', topLosses);
       document.getElementById('top-pnl').innerHTML = gainsHTML + lossesHTML;
       document.getElementById('top-pnl').classList.add('show');
     }
