@@ -1,113 +1,26 @@
+<script>
 /*
-  ABS Bundle Bubble Viewer
-  ---------------------------------
-  Drop this <script> after D3 v7 and your HTML elements:
-
-  Required HTML ids:
-    - #tokenAddr   (input for ERC-20 contract)
-    - #pair-info   (small info banner area)
-    - #bubble-map  (container where the SVG + stats render)
-
-  Optional: a button that calls window.showTokenHolders() on click.
-
-  Also include D3:
-    <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
-
-  Notes:
-    - Uses Etherscan-compatible ABS API (chainid=2741) you’re already using elsewhere.
-    - Creator pulled from contract creation metadata.
-    - Bundles are detected by finding the last incoming native transfer to the buyer
-      right before (<= 1h) or shortly after (<= 30s) their FIRST token buy.
-    - First 20 buyers legend with statuses: green(hold), blue(sold part), red(sold all), yellow(bought more).
-    - Labels show % of supply only (no address on bubbles).
+  ABS Bundle Bubble Viewer + TG Bot Highlights
+  --------------------------------------------
+  - Keeps your original pipeline (pairs, holders, bundles, first-20)
+  - Adds TG bot detection and visualization (gold ring + stats)
+  - No extra HTML required
 */
 
 (() => {
-  const API_KEY = "H13F5VZ64YYK4M21QMPEW78SIKJS85UTWT"; // replace if needed
+  const API_KEY = "H13F5VZ64YYK4M21QMPEW78SIKJS85UTWT";
   const BASE = "https://api.etherscan.io/v2/api"; // ABS-compatible
   const CHAIN_ID = 2741;
   const EXPLORER = "https://explorer.mainnet.abs.xyz";
+
+  // === TG bot (extracted) ===
+  const TG_BOT_ADDRESS = "0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f".toLowerCase();
 
   const burnAddresses = new Set([
     "0x0000000000000000000000000000000000000000",
     "0x000000000000000000000000000000000000dead"
   ]);
 
-/* ---------- First 20 buyers: dots + legend ---------- */
-
-// Colors (keep in sync with your bubble colors)
-const STATUS_COLORS = {
-  hold:    '#12d67a', // green
-  soldPart:'#3aa0ff', // blue
-  soldAll: '#ff5252', // red
-  more:    '#ffd34d'  // yellow (bought more)
-};
-
-function ensureFirst20Styles(){
-  if (document.getElementById('first20-dot-styles')) return;
-  const css = `
-    .first20-row { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
-    .first20-label { color:#bbb; font-size:.95rem; margin-right:.25rem; }
-    .dot { width:10px; height:10px; border-radius:50%; display:inline-block; cursor:pointer; }
-    .legend { display:flex; align-items:center; gap:14px; margin-top:.5rem; flex-wrap:wrap; opacity:.9; }
-    .legend .item { display:inline-flex; align-items:center; gap:6px; font-size:.85rem; color:#ccc; }
-  `;
-  const style = document.createElement('style');
-  style.id = 'first20-dot-styles';
-  style.textContent = css;
-  document.head.appendChild(style);
-}
-
-function openAddressOnExplorer(addr){
-  // Using AbstractScan to match your app
-  window.open(`https://explorer.mainnet.abs.xyz/address/${addr}`, '_blank');
-}
-
-function renderFirst20BuyersDots(containerEl, buyersArray){
-  ensureFirst20Styles();
-  if (!containerEl) return;
-
-  // buyersArray shape: [{ address:'0x..', status:'hold'|'soldPart'|'soldAll'|'more' }]
-  const row = document.createElement('div');
-  row.className = 'first20-row';
-
-  const label = document.createElement('div');
-  label.className = 'first20-label';
-  label.textContent = 'First 20 buyers:';
-  row.appendChild(label);
-
-  buyersArray.forEach(b => {
-    const dot = document.createElement('span');
-    dot.className = 'dot';
-    dot.style.background = STATUS_COLORS[b.status] || '#888';
-    // nice tooltip on hover – no text rendered inline
-    const statusText =
-      b.status === 'hold' ? 'Hold' :
-      b.status === 'soldPart' ? 'Sold Part' :
-      b.status === 'soldAll' ? 'Sold All' :
-      b.status === 'more' ? 'Bought More' : 'Unknown';
-    dot.title = `${b.address.slice(0,6)}…${b.address.slice(-4)} — ${statusText}`;
-    dot.onclick = () => openAddressOnExplorer(b.address);
-    row.appendChild(dot);
-  });
-
-  const legend = document.createElement('div');
-  legend.className = 'legend';
-  legend.innerHTML = `
-    <div class="item"><span class="dot" style="background:${STATUS_COLORS.hold}"></span> Hold</div>
-    <div class="item"><span class="dot" style="background:${STATUS_COLORS.soldPart}"></span> Sold Part</div>
-    <div class="item"><span class="dot" style="background:${STATUS_COLORS.soldAll}"></span> Sold All</div>
-    <div class="item"><span class="dot" style="background:${STATUS_COLORS.more}"></span> Bought More</div>
-  `;
-
-  containerEl.innerHTML = '';
-  containerEl.appendChild(row);
-  containerEl.appendChild(legend);
-}
-/* ---------------------------------------------------- */
-
-
-  
   // === Public entry point ===
   window.showTokenHolders = async function showTokenHolders() {
     const contractEl = document.getElementById('tokenAddr');
@@ -162,16 +75,27 @@ function renderFirst20BuyersDots(containerEl, buyersArray){
           ? cData.result[0].contractCreator.toLowerCase() : '';
       } catch {}
 
-      // 4) Build balances/graph & burn
+      // 4) Build balances/graph & burn + TG bot detection
       const balances = {};
       const connections = {};
       let burnedAmount = 0;
+
+      // wallets that received tokens directly from the TG bot
+      const tgRecipients = new Set();
+      // optional: how much they got from TG (not required for rendering)
+      const tgBuyAmounts = {};
 
       for (const tx of txs) {
         const decimals = parseInt(tx.tokenDecimal) || 18;
         const amount = parseFloat(tx.value) / Math.pow(10, decimals);
         const from = (tx.from || tx.fromAddress).toLowerCase();
         const to   = (tx.to   || tx.toAddress).toLowerCase();
+
+        // TG bot buy detection (extracted)
+        if (from === TG_BOT_ADDRESS) {
+          tgRecipients.add(to);
+          tgBuyAmounts[to] = (tgBuyAmounts[to] || 0) + amount;
+        }
 
         if (burnAddresses.has(to)) burnedAmount += amount;
         if (pairAddress && (from === pairAddress || to === pairAddress)) continue;
@@ -196,8 +120,9 @@ function renderFirst20BuyersDots(containerEl, buyersArray){
       const totalSupply = holders.reduce((s, h) => s + h.balance, 0) + burnedAmount;
 
       if (burnedAmount > 0) {
-        const burnedPercent = ((burnedAmount / totalSupply) * 100).toFixed(4);
-        pairInfoEl.innerHTML += `<br><span style="color:#ff4e4e">🔥 Burn detected — ${burnedAmount.toFixed(4)} tokens (${burnedPercent}% of supply)</span>`;
+        const burnedPercent = totalSupply ? ((burnedAmount / totalSupply) * 100).toFixed(4) : "0.0000";
+        document.getElementById('pair-info').innerHTML +=
+          `<br><span style="color:#ff4e4e">🔥 Burn detected — ${burnedAmount.toFixed(4)} tokens (${burnedPercent}% of supply)</span>`;
       }
 
       // 6) First 20 buyers (exclude mints)
@@ -257,21 +182,36 @@ function renderFirst20BuyersDots(containerEl, buyersArray){
       const bundlesAggregateTokens = bundleTotals.reduce((s, b) => s + b.tokens, 0);
       const bundlesAggregatePct = totalSupply ? (bundlesAggregateTokens / totalSupply) * 100 : 0;
 
-      // 8) First 20 buyers status + <10 count
-// after you computed the statuses for the first 20 buyers:
-const first20Statuses = first20Buyers.map(b => ({
-  address: b.address,
-  // map your internal flags to one of: 'hold' | 'soldPart' | 'soldAll' | 'more'
-  status: b.status   // <-- keep this as the exact string above
-}));
+      // 8) First 20 buyers statuses (WORKING)
+      // Status logic:
+      // - more: current balance > initial buy
+      // - hold: current balance >= initial buy (and not "more")
+      // - soldPart: 0 < current balance < initial buy
+      // - soldAll: current balance == 0
+      const first20Enriched = [];
+      let lt10Count = 0;
+      for (const t of first20) {
+        const addr = (t.to || t.toAddress).toLowerCase();
+        const initial = amountOnFirstBuy[addr] || 0;
+        const current = balances[addr] || 0;
+        const txCount = tokenTxCount[addr] || 0;
+        if (txCount < 10) lt10Count++;
 
-// render as dots + legend (no addresses shown inline)
-const first20Container = document.getElementById('first20'); // you added this in index.html
-renderFirst20BuyersDots(first20Container, first20Statuses);
+        let status = 'hold';
+        if (current === 0) status = 'soldAll';
+        else if (current > initial) status = 'more';
+        else if (current < initial) status = 'soldPart';
+        else status = 'hold';
 
+        first20Enriched.push({ address: addr, status });
+      }
 
       // 9) Stats & render
-      const holdersWithPct = holders.map(h => ({ ...h, pct: totalSupply ? (h.balance / totalSupply) * 100 : 0 }));
+      const holdersWithPct = holders.map(h => ({
+        ...h,
+        pct: totalSupply ? (h.balance / totalSupply) * 100 : 0
+      }));
+
       const top10Pct = holdersWithPct.slice().sort((a,b)=>b.pct-a.pct).slice(0,10).reduce((s,h)=>s+h.pct,0);
       const creatorPct = creatorAddress
         ? (holdersWithPct.find(h => h.address.toLowerCase() === creatorAddress)?.pct || 0)
@@ -281,10 +221,15 @@ renderFirst20BuyersDots(first20Container, first20Statuses);
         ([funder, set]) => Array.from(set).map(buyer => [buyer, funder])
       ));
 
+      // Count TG recipients among current holders and among first 20
+      const tgInHolders = holdersWithPct.filter(h => tgRecipients.has(h.address)).length;
+      const tgInFirst20 = first20Enriched.filter(b => tgRecipients.has(b.address)).length;
+
       renderBubbleMap({
         holders: holdersWithPct,
         totalSupply,
         addrToBundle,
+        tgRecipients,
         stats: {
           top10Pct,
           creatorPct,
@@ -294,7 +239,9 @@ renderFirst20BuyersDots(first20Container, first20Statuses);
           bundlesCount: Object.keys(bundles).length,
           bundlesAggregateTokens,
           bundlesAggregatePct,
-          topBundles: bundleTotals.slice(0, 3)
+          topBundles: bundleTotals.slice(0, 3),
+          tgInHolders,
+          tgInFirst20
         }
       });
     } catch (err) {
@@ -330,7 +277,7 @@ renderFirst20BuyersDots(first20Container, first20Statuses);
   }
 
   // Renderer
-  function renderBubbleMap({ holders, totalSupply, addrToBundle, stats }) {
+  function renderBubbleMap({ holders, totalSupply, addrToBundle, tgRecipients, stats }) {
     const mapEl = document.getElementById('bubble-map');
     mapEl.innerHTML = '';
 
@@ -368,18 +315,28 @@ renderFirst20BuyersDots(first20Container, first20Statuses);
         const bundle = addrToBundle[d.data.address];
         return bundle ? color(bundle) : '#4b5563'; // gray if not bundled
       })
+      .attr('stroke', d => tgRecipients.has(d.data.address) ? '#FFD700' : null)         // TG ring
+      .attr('stroke-width', d => tgRecipients.has(d.data.address) ? 2.5 : null)        // TG ring width
       .on('mouseover', function (event, d) {
         const bundle = addrToBundle[d.data.address];
+        const isTG = tgRecipients.has(d.data.address);
+
         g.selectAll('circle')
           .attr('opacity', node => bundle ? (addrToBundle[node.data.address] === bundle ? 1 : 0.15) : 1)
-          .attr('stroke', node => bundle && addrToBundle[node.data.address] === bundle ? '#FFD700' : null)
-          .attr('stroke-width', node => bundle && addrToBundle[node.data.address] === bundle ? 2 : null);
+          .attr('stroke', node => {
+            const inSameBundle = bundle && addrToBundle[node.data.address] === bundle;
+            const isNodeTG = tgRecipients.has(node.data.address);
+            // keep TG ring visible; if in same bundle, show bundle highlight border (gold dominates visually anyway)
+            return isNodeTG ? '#FFD700' : (inSameBundle ? '#FFD700' : d3.select(this).attr('stroke') || null);
+          })
+          .attr('stroke-width', node => tgRecipients.has(node.data.address) ? 2.5 : (bundle && addrToBundle[node.data.address] === bundle ? 2 : null));
 
         tip.html(
           `<div><strong>${d.data.pct.toFixed(4)}% of supply</strong></div>`+
           `<div>${d.data.balance.toLocaleString()} tokens</div>`+
           `<div>${d.data.address.slice(0,6)}...${d.data.address.slice(-4)}</div>`+
           (bundle ? `<div style="opacity:.8">Bundle funder: ${bundle.slice(0,6)}...${bundle.slice(-4)}</div>` : '')+
+          `<div style="opacity:.8">TG bot: ${isTG ? 'yes' : 'no'}</div>`+
           `<div style="opacity:.8;margin-top:6px">Click to open in explorer ↗</div>`
         )
         .style('left', (event.clientX + 12) + 'px')
@@ -391,7 +348,9 @@ renderFirst20BuyersDots(first20Container, first20Statuses);
       })
       .on('mouseout', function () {
         tip.style('opacity', 0);
-        g.selectAll('circle').attr('opacity', 1).attr('stroke', null).attr('stroke-width', null);
+        g.selectAll('circle').attr('opacity', 1)
+          .attr('stroke', d => tgRecipients.has(d.data.address) ? '#FFD700' : null)
+          .attr('stroke-width', d => tgRecipients.has(d.data.address) ? 2.5 : null);
       })
       .on('click', (event, d) => {
         window.open(`${EXPLORER}/address/${d.data.address}`, '_blank');
@@ -409,8 +368,12 @@ renderFirst20BuyersDots(first20Container, first20Statuses);
     // === Stats ===
     const legend = stats.first20Enriched.map(b => {
       const short = b.address.slice(0,6)+'...'+b.address.slice(-4);
-      const clr = b.status === 'green' ? '#00ff9c' : b.status === 'blue' ? '#4ea3ff' : b.status === 'red' ? '#ff4e4e' : '#ffd84e';
-      const lbl = b.status === 'green' ? 'Hold' : b.status === 'blue' ? 'Sold Part' : b.status === 'red' ? 'Sold All' : 'Bought More';
+      const clr = b.status === 'hold' ? '#00ff9c' :
+                  b.status === 'soldPart' ? '#4ea3ff' :
+                  b.status === 'soldAll' ? '#ff4e4e' : '#ffd84e'; // 'more'
+      const lbl = b.status === 'hold' ? 'Hold' :
+                  b.status === 'soldPart' ? 'Sold Part' :
+                  b.status === 'soldAll' ? 'Sold All' : 'Bought More';
       return `<span style="display:inline-flex;align-items:center;margin-right:10px;margin-bottom:6px">
         <span style="width:10px;height:10px;border-radius:50%;background:${clr};display:inline-block;margin-right:6px"></span>
         ${short} – ${lbl}
@@ -434,7 +397,10 @@ renderFirst20BuyersDots(first20Container, first20Statuses);
       ${topBundlesHtml ? `<div style="margin-top:6px">${topBundlesHtml}</div>` : ''}
       <div style="margin-top:10px">Among first 20 buyers, <strong>${stats.lt10Count}</strong> have &lt; 10 token tx.</div>
       <div style="margin-top:8px">First 20 buyers status: ${legend}</div>
+      <div style="margin-top:8px">TG bot recipients: <strong>${stats.tgInHolders}</strong> in holders, <strong>${stats.tgInFirst20}</strong> in first 20.</div>
+      <div style="opacity:.8;margin-top:6px">Gold ring = received tokens from TG bot</div>
     `;
     mapEl.appendChild(statsDiv);
   }
 })();
+</script>
