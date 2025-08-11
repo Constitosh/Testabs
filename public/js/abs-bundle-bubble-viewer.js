@@ -1,4 +1,3 @@
-<script>
 /*
   ABS Bundle Bubble Viewer + TG Bot Highlights
   --------------------------------------------
@@ -403,4 +402,3 @@
     mapEl.appendChild(statsDiv);
   }
 })();
-</script>
