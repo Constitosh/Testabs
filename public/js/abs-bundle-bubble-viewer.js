@@ -1,9 +1,10 @@
 /*
-  ABS Bundle Bubble Viewer + TG Bot Highlights + Proxy Filter + LP %
-  ------------------------------------------------------------------
-  - Keeps your original pipeline (pairs, holders, bundles, first-20)
-  - Adds TG bot detection (gold ring) + auto proxy filtering
-  - Shows holders count and % of supply in LP (pair)
+  ABS Bundle Bubble Viewer — correct supply %, LP bubble, TG + proxy filter
+  ------------------------------------------------------------------------
+  - Percentages use TRUE current supply: sum(positive balances) + LP + burned
+  - LP shows as a purple bubble labeled "LP"
+  - TG recipients ringed in gold; proxies auto-filtered from holders
+  - Stats: holders count, burn %, LP %, top10, bundles, etc.
 */
 
 (() => {
@@ -16,19 +17,16 @@
   const TG_BOT_ADDRESS = "0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f".toLowerCase();
 
   // Proxy detection (auto) + small static list (TG bot included)
-  const PROXY_BLOCKLIST = new Set([
-    TG_BOT_ADDRESS
-  ]);
-  const PROXY_MIN_DISTINCT_RECIPIENTS = 8;   // wide fan-out
-  const PROXY_END_BALANCE_EPS = 1e-12;       // near-zero end balance
-  const PROXY_OUTFLOW_SHARE = 0.90;          // ≥90% of flow is outgoing
+  const PROXY_BLOCKLIST = new Set([TG_BOT_ADDRESS]);
+  const PROXY_MIN_DISTINCT_RECIPIENTS = 8;
+  const PROXY_END_BALANCE_EPS = 1e-12;
+  const PROXY_OUTFLOW_SHARE = 0.90;
 
   const burnAddresses = new Set([
     "0x0000000000000000000000000000000000000000",
     "0x000000000000000000000000000000000000dead"
   ]);
 
-  // === Public entry point ===
   window.showTokenHolders = async function showTokenHolders() {
     const contractEl = document.getElementById('tokenAddr');
     const pairInfoEl = document.getElementById('pair-info');
@@ -48,20 +46,16 @@
     pairInfoEl.innerHTML = '';
     mapEl.innerHTML = '<p>Loading data...</p>';
 
-    // 1) Fetch LP/Pair to exclude from balances
+    // 1) LP/Pair address
     let pairAddress = null;
     try {
       const pairRes = await fetch(`https://api.dexscreener.com/token-pairs/v1/abstract/${contract}`);
       const pairData = await pairRes.json();
-      if (Array.isArray(pairData) && pairData.length > 0 && pairData[0]?.pairAddress) {
+      if (Array.isArray(pairData) && pairData[0]?.pairAddress) {
         pairAddress = pairData[0].pairAddress.toLowerCase().replace(":moon", "");
-        pairInfoEl.innerHTML = 'LP/Pair address excluded from view.';
-      } else {
-        pairInfoEl.innerHTML = 'No pair address found on DexScreener.';
       }
     } catch (e) {
       console.warn('DexScreener fetch error:', e);
-      pairInfoEl.innerHTML = 'Error fetching pair address.';
     }
 
     try {
@@ -72,7 +66,7 @@
       if (!Array.isArray(txData?.result)) throw new Error('No transactions found for this contract.');
       const txs = txData.result;
 
-      // 3) Creator address from metadata
+      // 3) Creator address
       let creatorAddress = '';
       try {
         const cUrl = `${BASE}?chainid=${CHAIN_ID}&module=contract&action=getcontractcreation&contractaddresses=${contract}&apikey=${API_KEY}`;
@@ -82,20 +76,19 @@
           ? cData.result[0].contractCreator.toLowerCase() : '';
       } catch {}
 
-      // 4) Build balances/graph & burn + TG bot detection + proxy stats + pair balance
-      const balances = {};
+      // 4) Build balances/graph + burn + TG + proxy stats + LP balance
+      const balances = {};           // running balances for all addresses (except contract itself)
       const connections = {};
       let burnedAmount = 0;
-      let pairTokenBalance = 0; // track LP token balance
+      let pairTokenBalance = 0;
 
-      // TG recipients (gold ring)
-      const tgRecipients = new Set();
-      const tgBuyAmounts = {};
-
-      // Proxy heuristics accumulators
+      // Heuristics
       const sendRecipients = {}; // addr -> Set(to)
       const inflow = {};         // addr -> tokens in
       const outflow = {};        // addr -> tokens out
+
+      // TG recipients
+      const tgRecipients = new Set();
 
       for (const tx of txs) {
         const decimals = parseInt(tx.tokenDecimal) || 18;
@@ -109,33 +102,29 @@
         inflow[to]    = (inflow[to]    || 0) + amount;
         outflow[from] = (outflow[from] || 0) + amount;
 
-        // Track LP balance (even if we exclude from holder calcs)
+        // LP balance tracking
         if (pairAddress) {
           if (to === pairAddress)   pairTokenBalance += amount;
           if (from === pairAddress) pairTokenBalance -= amount;
         }
 
-        // TG bot: mark recipients only
-        if (from === TG_BOT_ADDRESS) {
-          tgRecipients.add(to);
-          tgBuyAmounts[to] = (tgBuyAmounts[to] || 0) + amount;
-        }
+        // TG: tag recipients only
+        if (from === TG_BOT_ADDRESS) tgRecipients.add(to);
 
+        // burn
         if (burnAddresses.has(to)) burnedAmount += amount;
 
-        // Exclude pair + contract from holder propagation
-        if (pairAddress && (from === pairAddress || to === pairAddress)) continue;
+        // skip contract self-moves
         if (from === contract || to === contract) continue;
 
-        // Balance deltas (never credit the TG bot itself)
-        if (from !== '0x0000000000000000000000000000000000000000') {
-          balances[from] = (balances[from] || 0) - amount;
-        }
-        if (to !== '0x0000000000000000000000000000000000000000' && to !== TG_BOT_ADDRESS) {
-          balances[to] = (balances[to] || 0) + amount;
-        }
+        // NOTE: we do NOT skip pair here, because we want a truthful global supply later.
+        // We'll exclude the pair only when building the "holders" list for display.
 
-        // Graph
+        // balances
+        if (!burnAddresses.has(from)) balances[from] = (balances[from] || 0) - amount;
+        if (!burnAddresses.has(to))   balances[to]   = (balances[to]   || 0) + amount;
+
+        // graph
         if (!connections[from]) connections[from] = new Set();
         if (!connections[to])   connections[to]   = new Set();
         connections[from].add(to);
@@ -161,10 +150,16 @@
         }
       }
 
-      // Hard-remove proxies and TG bot from balances so they never render as holders
-      for (const p of proxyAddresses) delete balances[p];
+      // ---------- TRUE current supply ----------
+      // Sum of ALL positive balances (including pair/proxies/etc.) + burned
+      const sumPosBalances = Object.entries(balances)
+        .filter(([addr, bal]) => bal > 0 && addr !== contract)
+        .reduce((s, [, bal]) => s + bal, 0);
 
-      // 5) Top holders (cap)
+      const pairBalanceClamped = Math.max(0, pairTokenBalance);
+      const trueSupply = sumPosBalances + pairBalanceClamped + burnedAmount;
+
+      // ---------- Build display holders (exclude pair, proxies, burns, contract) ----------
       const holders = Object.entries(balances)
         .filter(([addr, bal]) =>
           bal > 0 &&
@@ -177,18 +172,12 @@
         .slice(0, 500)
         .map(([address, balance]) => ({ address, balance }));
 
-      // supply baseline (same model you used before: holders + burned)
-      const totalSupply = holders.reduce((s, h) => s + h.balance, 0) + burnedAmount;
-
-      // LP percent: compute against denom including LP balance
-      const pairBalanceClamped = Math.max(0, pairTokenBalance);
-      const denomForLP = totalSupply + pairBalanceClamped; // holders+burn + LP
-      const pairPctOfSupply = denomForLP > 0 ? (pairBalanceClamped / denomForLP) * 100 : 0;
+      // LP percent + Burn percent (now based on TRUE supply)
+      const lpPct = trueSupply > 0 ? (pairBalanceClamped / trueSupply) * 100 : 0;
+      const burnPct = trueSupply > 0 ? (burnedAmount / trueSupply) * 100 : 0;
 
       if (burnedAmount > 0) {
-        const burnedPercent = totalSupply ? ((burnedAmount / totalSupply) * 100).toFixed(4) : "0.0000";
-        document.getElementById('pair-info').innerHTML +=
-          `<br><span style="color:#ff4e4e">🔥 Burn detected — ${burnedAmount.toFixed(4)} tokens (${burnedPercent}% of supply)</span>`;
+        pairInfoEl.innerHTML += `<span style="color:#ff4e4e">🔥 Burn — ${burnedAmount.toLocaleString()} tokens (${burnPct.toFixed(4)}% of supply)</span>`;
       }
 
       // 6) First 20 buyers (exclude mints)
@@ -222,9 +211,8 @@
         };
       }
 
-      const funderByBuyer = {};       // buyer -> funder
-      const amountOnFirstBuy = {};    // buyer -> token amount at first buy
-
+      const funderByBuyer = {};
+      const amountOnFirstBuy = {};
       for (const buyer of Object.keys(firstBuyMeta)) {
         const fm = firstBuyMeta[buyer];
         amountOnFirstBuy[buyer] = fm.raw / Math.pow(10, fm.dec);
@@ -232,7 +220,7 @@
         if (funder) funderByBuyer[buyer] = funder;
       }
 
-      const bundles = {}; // funder -> Set(buyers)
+      const bundles = {};
       for (const [buyer, funder] of Object.entries(funderByBuyer)) {
         if (!bundles[funder]) bundles[funder] = new Set();
         bundles[funder].add(buyer);
@@ -241,19 +229,19 @@
       const bundleTotals = Object.entries(bundles).map(([funder, set]) => {
         const buyers = Array.from(set);
         const tokens = buyers.reduce((s, b) => s + (amountOnFirstBuy[b] || 0), 0);
-        const pct = totalSupply ? (tokens / totalSupply) * 100 : 0;
+        const pct = trueSupply ? (tokens / trueSupply) * 100 : 0;
         return { funder, buyers, tokens, pct };
       }).sort((a,b) => b.tokens - a.tokens);
 
       const bundlesAggregateTokens = bundleTotals.reduce((s, b) => s + b.tokens, 0);
-      const bundlesAggregatePct = totalSupply ? (bundlesAggregateTokens / totalSupply) * 100 : 0;
+      const bundlesAggregatePct = trueSupply ? (bundlesAggregateTokens / trueSupply) * 100 : 0;
 
-      // 8) First 20 buyers statuses
+      // 8) First 20 buyers statuses (vs current balances)
       const first20Enriched = [];
       let lt10Count = 0;
       for (const t of first20) {
         const addr = (t.to || t.toAddress).toLowerCase();
-        const initial = amountOnFirstBuy[addr] || 0;
+        const initial = (Number(t.value) / Math.pow(10, Number(t.tokenDecimal) || 18)) || 0;
         const current = balances[addr] || 0;
         const txCount = tokenTxCount[addr] || 0;
         if (txCount < 10) lt10Count++;
@@ -262,7 +250,6 @@
         if (current === 0) status = 'soldAll';
         else if (current > initial) status = 'more';
         else if (current < initial) status = 'soldPart';
-        else status = 'hold';
 
         first20Enriched.push({ address: addr, status });
       }
@@ -270,7 +257,7 @@
       // 9) Stats & render
       const holdersWithPct = holders.map(h => ({
         ...h,
-        pct: totalSupply ? (h.balance / totalSupply) * 100 : 0
+        pct: trueSupply ? (h.balance / trueSupply) * 100 : 0
       }));
 
       const top10Pct = holdersWithPct.slice().sort((a,b)=>b.pct-a.pct).slice(0,10).reduce((s,h)=>s+h.pct,0);
@@ -282,30 +269,38 @@
         ([funder, set]) => Array.from(set).map(buyer => [buyer, funder])
       ));
 
-      // Count TG recipients among current holders and among first 20
       const tgInHolders = holdersWithPct.filter(h => tgRecipients.has(h.address)).length;
       const tgInFirst20 = first20Enriched.filter(b => tgRecipients.has(b.address)).length;
 
+      // Synthesize an LP node for display (purple)
+      const lpNode = pairAddress ? [{
+        address: pairAddress,
+        balance: Math.max(pairBalanceClamped, trueSupply * 0.000001 || 0.000001), // tiny if 0
+        pct: trueSupply ? (pairBalanceClamped / trueSupply) * 100 : 0,
+        __type: 'lp'
+      }] : [];
+
       renderBubbleMap({
         holders: holdersWithPct,
-        totalSupply,
+        extras: lpNode,
+        trueSupply,
         addrToBundle,
         tgRecipients,
         stats: {
+          holdersCount: holdersWithPct.length,
           top10Pct,
           creatorPct,
           creatorAddress,
+          lpTokens: pairBalanceClamped,
+          lpPct,
+          burnedAmount,
+          burnPct,
           first20Enriched,
           lt10Count,
           bundlesCount: Object.keys(bundles).length,
           bundlesAggregateTokens,
           bundlesAggregatePct,
-          topBundles: bundleTotals.slice(0, 3),
-          tgInHolders,
-          tgInFirst20,
-          holdersCount: holdersWithPct.length,
-          pairBalance: pairBalanceClamped,
-          pairPctOfSupply
+          topBundles: bundleTotals.slice(0, 3)
         }
       });
     } catch (err) {
@@ -314,7 +309,7 @@
     }
   };
 
-  // Find the last incoming native transfer to `buyer` before firstBuyTs (<=1h) or shortly after (<=30s)
+  // Native funder near first buy
   async function findFunderNative(buyer, firstBuyTs) {
     const url = `${BASE}?chainid=${CHAIN_ID}&module=account&action=txlist&address=${buyer}&startblock=0&endblock=99999999&sort=asc&apikey=${API_KEY}`;
     try {
@@ -322,38 +317,38 @@
       const j = await r.json();
       const list = Array.isArray(j?.result) ? j.result : [];
       let best = null;
-      const beforeWindow = firstBuyTs - 3600; // <= 1 hour before
-      const afterWindow  = firstBuyTs + 30;   // <= 30s after
+      const beforeWindow = firstBuyTs - 3600;
+      const afterWindow  = firstBuyTs + 30;
       for (const t of list) {
         const ts = Number(t.timeStamp);
-        if (ts > afterWindow) break; // past window
-        // incoming native
+        if (ts > afterWindow) break;
         if ((t.to || '').toLowerCase() === buyer && Number(t.value) > 0) {
-          if (ts >= beforeWindow && ts <= afterWindow) best = t; // keep last in-window
-          else if (ts < beforeWindow) best = t; // still track the latest before window if nothing else
+          if (ts >= beforeWindow && ts <= afterWindow) best = t;
+          else if (ts < beforeWindow) best = t;
         }
       }
       return best ? (best.from || '').toLowerCase() : null;
-    } catch (e) {
-      console.warn('findFunderNative error', e);
+    } catch {
       return null;
     }
   }
 
   // Renderer
-  function renderBubbleMap({ holders, totalSupply, addrToBundle, tgRecipients, stats }) {
+  function renderBubbleMap({ holders, extras = [], trueSupply, addrToBundle, tgRecipients, stats }) {
     const mapEl = document.getElementById('bubble-map');
     mapEl.innerHTML = '';
 
     const width = mapEl.offsetWidth || 960;
     const height = 640;
 
+    const data = holders.concat(extras); // include LP node if present
+
     const svg = d3.select('#bubble-map').append('svg')
       .attr('width', width)
       .attr('height', height);
 
     const pack = d3.pack().size([width, height]).padding(3);
-    const root = d3.hierarchy({ children: holders }).sum(d => d.balance);
+    const root = d3.hierarchy({ children: data }).sum(d => d.balance);
     const nodes = pack(root).leaves();
 
     const distinctBundles = Array.from(new Set(Object.values(addrToBundle)));
@@ -376,31 +371,46 @@
     g.append('circle')
       .attr('r', d => d.r)
       .attr('fill', d => {
+        if (d.data.__type === 'lp') return '#8B5CF6'; // purple LP
         const bundle = addrToBundle[d.data.address];
-        return bundle ? color(bundle) : '#4b5563'; // gray if not bundled
+        return bundle ? color(bundle) : '#4b5563';
       })
-      .attr('stroke', d => tgRecipients.has(d.data.address) ? '#FFD700' : null)         // TG ring
-      .attr('stroke-width', d => tgRecipients.has(d.data.address) ? 2.5 : null)        // TG ring width
+      .attr('stroke', d => {
+        if (d.data.__type === 'lp') return '#C4B5FD';
+        return tgRecipients.has(d.data.address) ? '#FFD700' : null;
+      })
+      .attr('stroke-width', d => (d.data.__type === 'lp' || tgRecipients.has(d.data.address)) ? 2.5 : null)
       .on('mouseover', function (event, d) {
+        const isLP = d.data.__type === 'lp';
         const bundle = addrToBundle[d.data.address];
         const isTG = tgRecipients.has(d.data.address);
 
-        g.selectAll('circle')
-          .attr('opacity', node => bundle ? (addrToBundle[node.data.address] === bundle ? 1 : 0.15) : 1)
-          .attr('stroke', node => {
-            const inSameBundle = bundle && addrToBundle[node.data.address] === bundle;
-            const isNodeTG = tgRecipients.has(node.data.address);
-            return isNodeTG ? '#FFD700' : (inSameBundle ? '#FFD700' : d3.select(this).attr('stroke') || null);
-          })
-          .attr('stroke-width', node => tgRecipients.has(node.data.address) ? 2.5 : (bundle && addrToBundle[node.data.address] === bundle ? 2 : null));
+        if (!isLP) {
+          g.selectAll('circle')
+            .attr('opacity', node => bundle ? (addrToBundle[node.data.address] === bundle ? 1 : 0.15) : 1)
+            .attr('stroke', node => {
+              if (node.data.__type === 'lp') return '#C4B5FD';
+              const inSame = bundle && addrToBundle[node.data.address] === bundle;
+              const nodeTG = tgRecipients.has(node.data.address);
+              return nodeTG ? '#FFD700' : (inSame ? '#FFD700' : d3.select(this).attr('stroke') || null);
+            })
+            .attr('stroke-width', node => {
+              if (node.data.__type === 'lp') return 2.5;
+              return tgRecipients.has(node.data.address) ? 2.5 : (bundle && addrToBundle[node.data.address] === bundle ? 2 : null);
+            });
+        }
 
         tip.html(
-          `<div><strong>${d.data.pct.toFixed(4)}% of supply</strong></div>`+
-          `<div>${d.data.balance.toLocaleString()} tokens</div>`+
-          `<div>${d.data.address.slice(0,6)}...${d.data.address.slice(-4)}</div>`+
-          (bundle ? `<div style="opacity:.8">Bundle funder: ${bundle.slice(0,6)}...${bundle.slice(-4)}</div>` : '')+
-          `<div style="opacity:.8">TG bot: ${isTG ? 'yes' : 'no'}</div>`+
-          `<div style="opacity:.8;margin-top:6px">Click to open in explorer ↗</div>`
+          isLP
+            ? `<div><strong>LP</strong> — ${stats.lpTokens.toLocaleString()} tokens</div>
+               <div>${stats.lpPct.toFixed(4)}% of supply</div>
+               <div style="opacity:.8;margin-top:6px">Click to open in explorer ↗</div>`
+            : `<div><strong>${d.data.pct.toFixed(4)}% of supply</strong></div>
+               <div>${d.data.balance.toLocaleString()} tokens</div>
+               <div>${d.data.address.slice(0,6)}...${d.data.address.slice(-4)}</div>
+               ${bundle ? `<div style="opacity:.8">Bundle funder: ${bundle.slice(0,6)}...${bundle.slice(-4)}</div>` : ''}
+               <div style="opacity:.8">TG bot: ${isTG ? 'yes' : 'no'}</div>
+               <div style="opacity:.8;margin-top:6px">Click to open in explorer ↗</div>`
         )
         .style('left', (event.clientX + 12) + 'px')
         .style('top', (event.clientY + 12) + 'px')
@@ -412,28 +422,28 @@
       .on('mouseout', function () {
         tip.style('opacity', 0);
         g.selectAll('circle').attr('opacity', 1)
-          .attr('stroke', d => tgRecipients.has(d.data.address) ? '#FFD700' : null)
-          .attr('stroke-width', d => tgRecipients.has(d.data.address) ? 2.5 : null);
+          .attr('stroke', d => d.data.__type === 'lp' ? '#C4B5FD' : (tgRecipients.has(d.data.address) ? '#FFD700' : null))
+          .attr('stroke-width', d => (d.data.__type === 'lp' || tgRecipients.has(d.data.address)) ? 2.5 : null);
       })
       .on('click', (event, d) => {
         window.open(`${EXPLORER}/address/${d.data.address}`, '_blank');
       });
 
-    // % label only
+    // Labels: % for holders; "LP" for LP node
     g.append('text')
       .attr('dy', '.35em')
       .style('text-anchor', 'middle')
       .style('font-size', d => Math.min(d.r * 0.5, 16))
       .style('fill', '#fff')
       .style('pointer-events', 'none')
-      .text(d => `${d.data.pct.toFixed(2)}%`);
+      .text(d => d.data.__type === 'lp' ? 'LP' : `${d.data.pct.toFixed(2)}%`);
 
-    // === Stats ===
+    // === Stats panel ===
     const legend = stats.first20Enriched.map(b => {
       const short = b.address.slice(0,6)+'...'+b.address.slice(-4);
       const clr = b.status === 'hold' ? '#00ff9c' :
                   b.status === 'soldPart' ? '#4ea3ff' :
-                  b.status === 'soldAll' ? '#ff4e4e' : '#ffd84e'; // 'more'
+                  b.status === 'soldAll' ? '#ff4e4e' : '#ffd84e';
       const lbl = b.status === 'hold' ? 'Hold' :
                   b.status === 'soldPart' ? 'Sold Part' :
                   b.status === 'soldAll' ? 'Sold All' : 'Bought More';
@@ -443,9 +453,9 @@
       </span>`;
     }).join('');
 
-    const topBundlesHtml = stats.topBundles.map(b => (
+    const topBundlesHtml = stats.topBundles.map(b =>
       `<div>Bundle ${b.funder.slice(0,6)}...${b.funder.slice(-4)}: ${b.tokens.toLocaleString()} tokens (${b.pct.toFixed(4)}%) across ${b.buyers.length} wallets</div>`
-    )).join('');
+    ).join('');
 
     const statsDiv = document.createElement('div');
     statsDiv.style.marginTop = '10px';
@@ -455,16 +465,17 @@
       <div>Top 10 holders: <strong>${stats.top10Pct.toFixed(4)}%</strong></div>
       <div>Creator (${stats.creatorAddress ? stats.creatorAddress.slice(0,6)+'...'+stats.creatorAddress.slice(-4) : 'n/a'}) holding:
         <strong>${stats.creatorPct.toFixed(4)}%</strong></div>
-      <div>LP (pair) balance: <strong>${stats.pairBalance.toLocaleString()}</strong> tokens
-        (<strong>${stats.pairPctOfSupply.toFixed(4)}%</strong> of supply)</div>
+      <div>LP balance: <strong>${stats.lpTokens.toLocaleString()}</strong> tokens
+        (<strong>${stats.lpPct.toFixed(4)}%</strong> of supply)</div>
+      <div>🔥 Burn: <strong>${stats.burnedAmount.toLocaleString()}</strong> tokens
+        (<strong>${stats.burnPct.toFixed(4)}%</strong> of supply)</div>
       <div>Bundles detected: <strong>${stats.bundlesCount}</strong> main funders</div>
       <div>Bundles bought: <strong>${stats.bundlesAggregateTokens.toLocaleString()}</strong> tokens
         (<strong>${stats.bundlesAggregatePct.toFixed(4)}%</strong> of supply)</div>
       ${topBundlesHtml ? `<div style="margin-top:6px">${topBundlesHtml}</div>` : ''}
       <div style="margin-top:10px">Among first 20 buyers, <strong>${stats.lt10Count}</strong> have &lt; 10 token tx.</div>
       <div style="margin-top:8px">First 20 buyers status: ${legend}</div>
-      <div style="margin-top:8px">TG bot recipients: <strong>${stats.tgInHolders}</strong> in holders, <strong>${stats.tgInFirst20}</strong> in first 20.</div>
-      <div style="opacity:.8;margin-top:6px">Gold ring = received tokens from TG bot</div>
+      <div style="opacity:.8;margin-top:6px">Purple bubble = LP • Gold ring = received tokens from TG bot</div>
     `;
     mapEl.appendChild(statsDiv);
   }
