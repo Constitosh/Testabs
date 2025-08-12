@@ -1,9 +1,9 @@
 /*
-  ABS Bundle Bubble Viewer + TG Bot Highlights
-  --------------------------------------------
+  ABS Bundle Bubble Viewer + TG Bot Highlights + Proxy Filter + LP %
+  ------------------------------------------------------------------
   - Keeps your original pipeline (pairs, holders, bundles, first-20)
-  - Adds TG bot detection and visualization (gold ring + stats)
-  - No extra HTML required
+  - Adds TG bot detection (gold ring) + auto proxy filtering
+  - Shows holders count and % of supply in LP (pair)
 */
 
 (() => {
@@ -12,8 +12,16 @@
   const CHAIN_ID = 2741;
   const EXPLORER = "https://explorer.mainnet.abs.xyz";
 
-  // === TG bot (extracted) ===
+  // TG bot (recipients only)
   const TG_BOT_ADDRESS = "0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f".toLowerCase();
+
+  // Proxy detection (auto) + small static list (TG bot included)
+  const PROXY_BLOCKLIST = new Set([
+    TG_BOT_ADDRESS
+  ]);
+  const PROXY_MIN_DISTINCT_RECIPIENTS = 8;   // wide fan-out
+  const PROXY_END_BALANCE_EPS = 1e-12;       // near-zero end balance
+  const PROXY_OUTFLOW_SHARE = 0.90;          // ≥90% of flow is outgoing
 
   const burnAddresses = new Set([
     "0x0000000000000000000000000000000000000000",
@@ -74,15 +82,20 @@
           ? cData.result[0].contractCreator.toLowerCase() : '';
       } catch {}
 
-      // 4) Build balances/graph & burn + TG bot detection
+      // 4) Build balances/graph & burn + TG bot detection + proxy stats + pair balance
       const balances = {};
       const connections = {};
       let burnedAmount = 0;
+      let pairTokenBalance = 0; // track LP token balance
 
-      // wallets that received tokens directly from the TG bot
+      // TG recipients (gold ring)
       const tgRecipients = new Set();
-      // optional: how much they got from TG (not required for rendering)
       const tgBuyAmounts = {};
+
+      // Proxy heuristics accumulators
+      const sendRecipients = {}; // addr -> Set(to)
+      const inflow = {};         // addr -> tokens in
+      const outflow = {};        // addr -> tokens out
 
       for (const tx of txs) {
         const decimals = parseInt(tx.tokenDecimal) || 18;
@@ -90,33 +103,87 @@
         const from = (tx.from || tx.fromAddress).toLowerCase();
         const to   = (tx.to   || tx.toAddress).toLowerCase();
 
-        // TG bot buy detection (extracted)
+        // Heuristic stats
+        if (!sendRecipients[from]) sendRecipients[from] = new Set();
+        sendRecipients[from].add(to);
+        inflow[to]    = (inflow[to]    || 0) + amount;
+        outflow[from] = (outflow[from] || 0) + amount;
+
+        // Track LP balance (even if we exclude from holder calcs)
+        if (pairAddress) {
+          if (to === pairAddress)   pairTokenBalance += amount;
+          if (from === pairAddress) pairTokenBalance -= amount;
+        }
+
+        // TG bot: mark recipients only
         if (from === TG_BOT_ADDRESS) {
           tgRecipients.add(to);
           tgBuyAmounts[to] = (tgBuyAmounts[to] || 0) + amount;
         }
 
         if (burnAddresses.has(to)) burnedAmount += amount;
+
+        // Exclude pair + contract from holder propagation
         if (pairAddress && (from === pairAddress || to === pairAddress)) continue;
         if (from === contract || to === contract) continue;
 
-        if (from !== '0x0000000000000000000000000000000000000000') balances[from] = (balances[from] || 0) - amount;
-        if (to   !== '0x0000000000000000000000000000000000000000') balances[to]   = (balances[to]   || 0) + amount;
+        // Balance deltas (never credit the TG bot itself)
+        if (from !== '0x0000000000000000000000000000000000000000') {
+          balances[from] = (balances[from] || 0) - amount;
+        }
+        if (to !== '0x0000000000000000000000000000000000000000' && to !== TG_BOT_ADDRESS) {
+          balances[to] = (balances[to] || 0) + amount;
+        }
 
+        // Graph
         if (!connections[from]) connections[from] = new Set();
         if (!connections[to])   connections[to]   = new Set();
         connections[from].add(to);
         connections[to].add(from);
       }
 
+      // Auto-detect proxies
+      const proxyAddresses = new Set(PROXY_BLOCKLIST);
+      for (const addr of Object.keys(sendRecipients)) {
+        const recipients = sendRecipients[addr]?.size || 0;
+        const endBal = Math.abs(balances[addr] || 0);
+        const out = outflow[addr] || 0;
+        const inn = inflow[addr] || 0;
+        const flow = out + inn;
+        const outShare = flow > 0 ? (out / flow) : 0;
+
+        if (
+          recipients >= PROXY_MIN_DISTINCT_RECIPIENTS &&
+          endBal <= PROXY_END_BALANCE_EPS &&
+          outShare >= PROXY_OUTFLOW_SHARE
+        ) {
+          proxyAddresses.add(addr);
+        }
+      }
+
+      // Hard-remove proxies and TG bot from balances so they never render as holders
+      for (const p of proxyAddresses) delete balances[p];
+
       // 5) Top holders (cap)
       const holders = Object.entries(balances)
-        .filter(([addr, bal]) => bal > 0 && addr !== pairAddress && addr !== contract && !burnAddresses.has(addr))
+        .filter(([addr, bal]) =>
+          bal > 0 &&
+          addr !== contract &&
+          (!pairAddress || addr !== pairAddress) &&
+          !burnAddresses.has(addr) &&
+          !proxyAddresses.has(addr)
+        )
         .sort((a, b) => b[1] - a[1])
         .slice(0, 500)
         .map(([address, balance]) => ({ address, balance }));
 
+      // supply baseline (same model you used before: holders + burned)
       const totalSupply = holders.reduce((s, h) => s + h.balance, 0) + burnedAmount;
+
+      // LP percent: compute against denom including LP balance
+      const pairBalanceClamped = Math.max(0, pairTokenBalance);
+      const denomForLP = totalSupply + pairBalanceClamped; // holders+burn + LP
+      const pairPctOfSupply = denomForLP > 0 ? (pairBalanceClamped / denomForLP) * 100 : 0;
 
       if (burnedAmount > 0) {
         const burnedPercent = totalSupply ? ((burnedAmount / totalSupply) * 100).toFixed(4) : "0.0000";
@@ -181,12 +248,7 @@
       const bundlesAggregateTokens = bundleTotals.reduce((s, b) => s + b.tokens, 0);
       const bundlesAggregatePct = totalSupply ? (bundlesAggregateTokens / totalSupply) * 100 : 0;
 
-      // 8) First 20 buyers statuses (WORKING)
-      // Status logic:
-      // - more: current balance > initial buy
-      // - hold: current balance >= initial buy (and not "more")
-      // - soldPart: 0 < current balance < initial buy
-      // - soldAll: current balance == 0
+      // 8) First 20 buyers statuses
       const first20Enriched = [];
       let lt10Count = 0;
       for (const t of first20) {
@@ -240,7 +302,10 @@
           bundlesAggregatePct,
           topBundles: bundleTotals.slice(0, 3),
           tgInHolders,
-          tgInFirst20
+          tgInFirst20,
+          holdersCount: holdersWithPct.length,
+          pairBalance: pairBalanceClamped,
+          pairPctOfSupply
         }
       });
     } catch (err) {
@@ -325,7 +390,6 @@
           .attr('stroke', node => {
             const inSameBundle = bundle && addrToBundle[node.data.address] === bundle;
             const isNodeTG = tgRecipients.has(node.data.address);
-            // keep TG ring visible; if in same bundle, show bundle highlight border (gold dominates visually anyway)
             return isNodeTG ? '#FFD700' : (inSameBundle ? '#FFD700' : d3.select(this).attr('stroke') || null);
           })
           .attr('stroke-width', node => tgRecipients.has(node.data.address) ? 2.5 : (bundle && addrToBundle[node.data.address] === bundle ? 2 : null));
@@ -387,9 +451,12 @@
     statsDiv.style.marginTop = '10px';
     statsDiv.innerHTML = `
       <div class="section-title" style="padding-left:0">Stats</div>
+      <div>Holders: <strong>${stats.holdersCount}</strong></div>
       <div>Top 10 holders: <strong>${stats.top10Pct.toFixed(4)}%</strong></div>
       <div>Creator (${stats.creatorAddress ? stats.creatorAddress.slice(0,6)+'...'+stats.creatorAddress.slice(-4) : 'n/a'}) holding:
         <strong>${stats.creatorPct.toFixed(4)}%</strong></div>
+      <div>LP (pair) balance: <strong>${stats.pairBalance.toLocaleString()}</strong> tokens
+        (<strong>${stats.pairPctOfSupply.toFixed(4)}%</strong> of supply)</div>
       <div>Bundles detected: <strong>${stats.bundlesCount}</strong> main funders</div>
       <div>Bundles bought: <strong>${stats.bundlesAggregateTokens.toLocaleString()}</strong> tokens
         (<strong>${stats.bundlesAggregatePct.toFixed(4)}%</strong> of supply)</div>
