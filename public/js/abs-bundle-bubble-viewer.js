@@ -1,14 +1,19 @@
 /*
-  Totally ABS Bubble Viewer — v4 (adds VESTED bubbles)
+  Totally ABS Bubble Viewer — v4.1
   ------------------------------------------------------------------
-  - BigInt math + robust decimals inference
-  - Full pagination for tokentx
-  - Multi-LP via Dexscreener, LP balances via tokenbalance (fallback to net)
-  - VESTED addresses: excluded from holders/circulating, shown as teal bubbles
-  - Circulating (tracked) clamped ≤ (minted − burned)
-  - First 20 buyers legend (Hold / Sold Part / Sold All / Bought More)
-  - Early snipe / insider / TG / LP rings
-  - Top holders cross-checked via tokenbalance; known system/proxy excluded
+  Fixes:
+    - Circulating (tracked) now computed from the full filtered balances (pre-verification).
+    - We NO LONGER drop top holders when tokenbalance verification is unresponsive; we only override when we get a value.
+    - Add a "Circulating (supply − LP − VESTED)" sanity line in Stats for quick reconciliation.
+
+  Features kept:
+    - BigInt math + robust decimals inference
+    - Full pagination for tokentx
+    - Multi-LP via Dexscreener, LP balances via tokenbalance (fallback to net)
+    - VESTED bubbles (teal) excluded from holders/circulating
+    - First 20 buyers legend (Hold / Sold Part / Sold All / Bought More)
+    - Early snipe / insider / TG / LP rings
+    - Top holders cross-checked via tokenbalance; known system/proxy excluded
 
   Bubble fills:
     LP      = purple  (#8B5CF6)
@@ -35,17 +40,15 @@
 
   // Always exclude: addresses you *never* want counted as holders/circulating
   const ALWAYS_EXCLUDE_ADDRESSES = new Set([
-    // keep empty if you plan to show some as VESTED bubbles instead
+    // add any permanent exclusions here
   ]);
 
   // VESTED addresses — excluded from holders/circulating, rendered as teal bubbles
-  // Option A: global list (applies to all tokens)
   const VESTED_ADDRESSES_GLOBAL = new Set([
-    // "0x...".toLowerCase(),
+    // global vesting vaults (if any)
   ]);
-  // Option B: per-token list
   const VESTED_ADDRESSES_BY_TOKEN = {
-    // Example from your message: vesting wallet for this token
+    // example you gave
     "0xd5cc17f92b41d57a4b34d4b08587bf55342d4bc1": [
       "0x1d48d1cb9b51dbed2443d7451eae1060ccc27ba8",
     ],
@@ -58,22 +61,22 @@
   const PROXY_OUTFLOW_SHARE_DEN = 100n;
 
   // Early snipe / insider heuristics
-  const LAUNCH_WINDOW_SECS = 900;    // seconds after first LP add
+  const LAUNCH_WINDOW_SECS = 180;
   const EARLY_SNIPE_MIN_PCT = 0.20;  // ≥ 0.20% of current supply OR top-K
-  const EARLY_TOP_K = 25;            // top 10 early buys by size
-  const INSIDER_FUNDER_MIN = 3;      // funder bankrolls ≥3 early buyers
+  const EARLY_TOP_K = 10;
+  const INSIDER_FUNDER_MIN = 3;
 
   // Verify top N holders via explorer tokenbalance
   const VERIFY_TOP_N = 150;
-  const VERIFY_CONCURRENCY = 4;
-  const DROP_UNVERIFIED_TOP_HOLDERS = true;
+  const VERIFY_CONCURRENCY = 3; // gentler
+  const VERIFY_RETRIES = 2;     // retry on null
+  // IMPORTANT: we do NOT drop unverified anymore.
 
   // Burns / mints
   const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
   const DEAD_ADDR = "0x000000000000000000000000000000000000dead";
   const burnAddresses = new Set([ZERO_ADDR, DEAD_ADDR]);
 
-  // Render cap
   const RENDER_TOP_N = 500;
 
   // ===== HELPERS =====
@@ -93,9 +96,9 @@
 
   function pctUnits(numBI, denBI) {
     if (denBI === 0n) return 0;
-    const SCALE = 1_000_000n;               // 1e6
-    const q = (numBI * SCALE) / denBI;      // scaled ratio
-    return Number(q) / 10_000;              // => percentage with 2+ dp
+    const SCALE = 1_000_000n;
+    const q = (numBI * SCALE) / denBI;
+    return Number(q) / 10_000;
   }
 
   function countTrailingZeros10(u) {
@@ -104,7 +107,6 @@
     return n;
   }
   function chooseDecimals(txs) {
-    // Mode of tokenDecimal across txs (0..18), fallback by trailing-zero histogram
     const freq = new Map();
     for (const t of txs) {
       const raw = t.tokenDecimal;
@@ -144,10 +146,9 @@
       all.push(...arr);
       if (arr.length < offset) break;
       page++;
-      if (page > 200) break; // safety
+      if (page > 200) break;
     }
     if (all.length === 0) {
-      // fallback single-shot
       const url = `${BASE}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&startblock=0&endblock=99999999&sort=asc&apikey=${API_KEY}`;
       const r = await fetch(url);
       const j = await r.json();
@@ -183,10 +184,10 @@
       const raw = j?.result;
       if (raw != null && /^[0-9]+$/.test(String(raw))) return BigInt(raw);
     } catch {}
-    return null;
+    return null; // unreachable or rate-limited
   }
 
-  // ===== VERIFY TOP HOLDERS =====
+  // ===== VERIFY TOP HOLDERS (retry, no-drop on null) =====
   async function verifyTopBalances(contract, addresses) {
     const out = {};
     let idx = 0;
@@ -195,8 +196,11 @@
         const i = idx++;
         const addr = addresses[i];
         let v = null;
-        try { v = await tokenBalanceOf(contract, addr); }
-        catch {}
+        for (let attempt=0; attempt<=VERIFY_RETRIES; attempt++) {
+          v = await tokenBalanceOf(contract, addr);
+          if (v !== null) break;
+          await new Promise(res => setTimeout(res, 250 * (attempt+1)));
+        }
         out[addr] = v; // BigInt or null
       }
     }
@@ -224,7 +228,7 @@
     pairInfoEl.innerHTML = '';
     mapEl.innerHTML = '<p>Loading data...</p>';
 
-    // 1) Dexscreener pairs (ALL)
+    // Dexscreener pairs (ALL)
     let pairAddresses = [];
     try {
       const pairRes = await fetch(`https://api.dexscreener.com/token-pairs/v1/abstract/${contract}`);
@@ -241,7 +245,7 @@
     pairAddresses = Array.from(new Set(pairAddresses));
     const pairSet = new Set(pairAddresses);
 
-    // 1a) VESTED set for this token
+    // VESTED set for this token
     const vestedList = new Set([
       ...VESTED_ADDRESSES_GLOBAL,
       ...(VESTED_ADDRESSES_BY_TOKEN[contract]?.map(a => a.toLowerCase()) || []),
@@ -249,13 +253,12 @@
     const vestedSet = new Set(vestedList);
 
     try {
-      // 2) All token transfers
+      // All token transfers
       const txs = await fetchAllTokenTx(contract);
       if (!txs.length) throw new Error('No transactions found.');
-
       const tokenDecimals = chooseDecimals(txs);
 
-      // 3) Creator
+      // Creator
       let creatorAddress = '';
       try {
         const cUrl = `${BASE}?chainid=${CHAIN_ID}&module=contract&action=getcontractcreation&contractaddresses=${contract}&apikey=${API_KEY}`;
@@ -265,8 +268,8 @@
           ? cData.result[0].contractCreator.toLowerCase() : '';
       } catch {}
 
-      // 4) Balances & flows (BigInt)
-      const balances = {};  // address -> BigInt
+      // Balances & flows (BigInt)
+      const balances = {};
       const inflow = {};
       const outflow = {};
       const sendRecipients = {};
@@ -301,13 +304,14 @@
         if (!burnAddresses.has(to))   balances[to]   = (balances[to]   || 0n) + units;
       }
 
-      // 5) Distributor/proxy detection + blocklists
+      // Proxy/system/vesting exclusion set
       const proxyAddresses = new Set([
         ...KNOWN_SYSTEM_ADDRESSES,
         ...ALWAYS_EXCLUDE_ADDRESSES,
-        ...vestedSet, // exclude vested from holders/circulating (we render as bubbles)
+        ...vestedSet,
       ]);
 
+      // Auto proxy detection
       for (const addr of Object.keys(sendRecipients)) {
         const recipients = sendRecipients[addr]?.size || 0;
         const endBal = balances[addr] || 0n;
@@ -322,12 +326,12 @@
         }
       }
 
-      // 6) Supply
+      // Supply
       const minted = mintedUnits;
       const burned = burnedUnits;
       const currentSupply = minted >= burned ? (minted - burned) : 0n;
 
-      // 7) LP balances (per pair) via tokenbalance (fallback to net)
+      // LP balances (per pair)
       const lpPerPair = [];
       let lpUnitsSum = 0n;
       for (let i=0; i<pairAddresses.length; i++) {
@@ -342,7 +346,7 @@
       }
       const lpPct = currentSupply > 0n ? pctUnits(lpUnitsSum, currentSupply) : 0;
 
-      // 7a) VESTED balances (per vested address)
+      // VESTED balances
       const vestedPerAddr = [];
       let vestedUnitsSum = 0n;
       for (const va of vestedSet) {
@@ -356,7 +360,7 @@
       }
       const vestedPct = currentSupply > 0n ? pctUnits(vestedUnitsSum, currentSupply) : 0;
 
-      // 8) First pass holders (exclude LPs, VESTED, contract, burn sinks, proxies/known systems)
+      // Holders (first pass, pre-verification)
       let holderEntries = Object.entries(balances)
         .filter(([addr, bal]) =>
           bal > 0n &&
@@ -367,7 +371,20 @@
         )
         .map(([address, units]) => ({ address, units }));
 
-      // 9) VERIFY TOP HOLDERS via tokenbalance (override/drop)
+      // === Circulating (tracked) — from full filtered balances (pre-verification) ===
+      let circulatingTrackedUnits = holderEntries.reduce((s, h) => s + h.units, 0n);
+      if (circulatingTrackedUnits > currentSupply) {
+        console.warn('Circulating > currentSupply; clamping.', {
+          circ: circulatingTrackedUnits.toString(),
+          supply: currentSupply.toString()
+        });
+        circulatingTrackedUnits = currentSupply;
+      }
+      // Also compute reconciliation (supply − LP − VESTED)
+      const circulatingReconUnits = currentSupply - lpUnitsSum - vestedUnitsSum;
+      const circulatingRecon = circulatingReconUnits < 0n ? 0n : circulatingReconUnits;
+
+      // Verify top holders (override only; do NOT drop on null)
       holderEntries.sort((a,b)=> (b.units > a.units) ? 1 : (b.units < a.units) ? -1 : 0);
       const toVerify = holderEntries.slice(0, VERIFY_TOP_N).map(h => h.address);
       const verified = await verifyTopBalances(contract, toVerify);
@@ -378,12 +395,13 @@
         if (verifiedSet.has(h.address)) {
           const v = verified[h.address];
           if (v === null) {
-            if (DROP_UNVERIFIED_TOP_HOLDERS) continue; // drop if unverified
+            // keep computed if unverified
             corrected.push(h);
           } else if (v === 0n) {
-            continue; // explorer says zero -> drop
+            // drop if explorer confidently says zero
+            continue;
           } else {
-            corrected.push({ address: h.address, units: v }); // override
+            corrected.push({ address: h.address, units: v }); // override with explorer
           }
         } else {
           corrected.push(h);
@@ -391,17 +409,7 @@
       }
       holderEntries = corrected;
 
-      // 10) Circulating (tracked) after verification, clamp
-      let circulatingTrackedUnits = holderEntries.reduce((s, h) => s + h.units, 0n);
-      if (circulatingTrackedUnits > currentSupply) {
-        console.warn('Circulating > currentSupply; clamping.', {
-          circ: circulatingTrackedUnits.toString(),
-          supply: currentSupply.toString()
-        });
-        circulatingTrackedUnits = currentSupply;
-      }
-
-      // 11) Final holders (top N to render) + % of CURRENT supply
+      // Final holders for rendering
       holderEntries.sort((a,b)=> (b.units > a.units) ? 1 : (b.units < a.units) ? -1 : 0);
       const holders = holderEntries
         .slice(0, RENDER_TOP_N)
@@ -410,7 +418,7 @@
       const fullHoldersCount = holderEntries.length;
       const burnPctVsMinted = minted > 0n ? pctUnits(burned, minted) : 0;
 
-      // 12) First 20 buyers (exclude mints) + status legend
+      // First 20 buyers legend
       const tokenTxCount = {};
       for (const t of txs) {
         const f = (t.from || t.fromAddress).toLowerCase();
@@ -418,7 +426,6 @@
         tokenTxCount[f] = (tokenTxCount[f] || 0) + 1;
         tokenTxCount[to] = (tokenTxCount[to] || 0) + 1;
       }
-
       const buyerSeen = new Set();
       const first20 = [];
       for (const t of txs) {
@@ -428,13 +435,12 @@
         if (!buyerSeen.has(to)) { buyerSeen.add(to); first20.push(t); }
         if (first20.length >= 20) break;
       }
-
       const first20Enriched = [];
       let lt10Count = 0;
       for (const t of first20) {
         const addr = (t.to || t.toAddress).toLowerCase();
         const initialUnits = toBI(t.value);
-        const currentUnits = (balances[addr] || 0n) + 0n;
+        const currentUnits = (balances[addr] || 0n);
         const txCount = tokenTxCount[addr] || 0;
         if (txCount < 10) lt10Count++;
         let status = 'hold';
@@ -444,7 +450,7 @@
         first20Enriched.push({ address: addr, status });
       }
 
-      // 13) Early window snipe / insider
+      // Early window snipe / insider
       const addrFlags = {};
       if (firstLiquidityTs) {
         const launchStart = firstLiquidityTs;
@@ -461,22 +467,18 @@
           const units = toBI(t.value);
           earlyBuysByAddrUnits[to] = (earlyBuysByAddrUnits[to] || 0n) + units;
         }
-
         const ranked = Object.entries(earlyBuysByAddrUnits)
           .map(([addr, units]) => ({ addr, units }))
           .sort((a,b)=> (b.units > a.units) ? 1 : (b.units < a.units) ? -1 : 0);
-
         const topCut = new Set(ranked.slice(0, EARLY_TOP_K).map(x => x.addr));
         for (const {addr, units} of ranked) {
           if (!addrFlags[addr]) addrFlags[addr] = {};
           addrFlags[addr].early = true;
           if (currentSupply > 0n) {
-            const pr = pctUnits(units, currentSupply); // %
+            const pr = pctUnits(units, currentSupply);
             if (pr >= EARLY_SNIPE_MIN_PCT || topCut.has(addr)) addrFlags[addr].snipe = true;
           }
         }
-
-        // Funders for first ~150 early buyers
         const earlyAddrs = ranked.slice(0, 150).map(x => x.addr);
         const funderByBuyer = {};
         const funderCounts = {};
@@ -507,19 +509,18 @@
         }
       }
 
-      // 14) Stats
+      // Stats
       const top10Pct = holders.slice(0,10).reduce((s,h)=>s+h.pct,0);
       const creatorPct = creatorAddress
         ? (holders.find(h => h.address.toLowerCase() === creatorAddress)?.pct || 0)
         : 0;
 
-      // Funder tooltip map (for early buyers)
       const addrToBundle = {};
       for (const [addr, flags] of Object.entries(addrFlags)) {
         if (flags.fundedBy) addrToBundle[addr] = flags.fundedBy;
       }
 
-      // LP nodes (render)
+      // LP & VESTED render nodes
       const lpNodes = lpPerPair.map((p, i) => ({
         address: p.address,
         balance: toNum(p.units, tokenDecimals),
@@ -527,8 +528,6 @@
         __type: 'lp',
         __label: `LP-${i+1}`
       }));
-
-      // VESTED nodes (render)
       const vestedNodes = vestedPerAddr.map((v, i) => ({
         address: v.address,
         balance: toNum(v.units, tokenDecimals),
@@ -545,7 +544,8 @@
         mintedUnits,
         burnedUnits,
         currentSupply,
-        circulatingTrackedUnits,
+        circulatingTrackedUnits, // pre-verification sum
+        circulatingRecon,        // supply − LP − VESTED
         addrToBundle,
         tgRecipients,
         addrFlags,
@@ -586,7 +586,8 @@
   // ===== RENDERER =====
   function renderBubbleMap({
     tokenDecimals, holders, extras = [],
-    mintedUnits, burnedUnits, currentSupply, circulatingTrackedUnits,
+    mintedUnits, burnedUnits, currentSupply,
+    circulatingTrackedUnits, circulatingRecon,
     addrToBundle, tgRecipients, addrFlags, lpPerPair, vestedPerAddr, stats
   }) {
     const mapEl = document.getElementById('bubble-map');
@@ -624,7 +625,6 @@
       if (tgRecipients.has(addr)) return '#FFD700'; // gold
       return null;
     }
-
     function fillFor(d) {
       if (d.data.__type === 'lp')     return '#8B5CF6'; // purple
       if (d.data.__type === 'vested') return '#14B8A6'; // teal
@@ -706,7 +706,7 @@
                     ? (d.data.__label || 'VESTED')
                     : `${d.data.pct.toFixed(2)}%`);
 
-    // === Stats (incl. First 20 legend + LP & VESTED sections) ===
+    // === Stats (incl. Circulating reconciliation) ===
     const legend = stats.first20Enriched.map(b => {
       const short = b.address.slice(0,6)+'...'+b.address.slice(-4);
       const clr = b.status === 'hold' ? '#00ff9c' :
@@ -727,7 +727,6 @@
     const lpLines = lpPerPair.map((p, i) =>
       `<div>LP-${i+1} (${p.address.slice(0,6)}...${p.address.slice(-4)}): <strong>${(Number(p.units / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>`
     ).join('');
-
     const vestedLines = vestedPerAddr.map((v, i) =>
       `<div>${vestedPerAddr.length===1 ? 'VESTED' : `VESTED-${i+1}`} (${v.address.slice(0,6)}...${v.address.slice(-4)}): <strong>${(Number(v.units / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>`
     ).join('');
@@ -738,7 +737,10 @@
       <div>🔥 Burn: <strong>${(Number(burnedUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens
         (<strong>${stats.burnPctVsMinted.toFixed(4)}%</strong> of minted)</div>
       <div>Current supply (minted − burned): <strong>${(Number(currentSupply / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>
+
       <div>Circulating (tracked)*: <strong>${(Number(circulatingTrackedUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>
+      <div style="opacity:.8">Circulating (supply − LP − VESTED): <strong>${(Number(circulatingRecon / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>
+
       <div>Holders (displayed / total): <strong>${holders.length}</strong> / <strong>${stats.holdersCount}</strong></div>
       <div>Top 10 holders: <strong>${stats.top10Pct.toFixed(4)}%</strong> (of current supply)</div>
       <div>Creator (${stats.creatorAddress ? stats.creatorAddress.slice(0,6)+'...'+stats.creatorAddress.slice(-4) : 'n/a'}) holding:
