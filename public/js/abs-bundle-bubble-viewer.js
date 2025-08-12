@@ -26,7 +26,7 @@
   const PROXY_OUTFLOW_SHARE_DEN = 100n;
 
   // Early snipe/insider
-  const LAUNCH_WINDOW_SECS = 180;
+  const LAUNCH_WINDOW_SECS = 900;
   const EARLY_SNIPE_MIN_PCT = 0.20; // ≥0.20% of current supply
   const EARLY_TOP_K = 10;
   const INSIDER_FUNDER_MIN = 3;
