@@ -1,10 +1,10 @@
 /*
   Totally ABS Bundle Bubble Viewer — correct supply %, LP bubble, TG + proxy filter
   ------------------------------------------------------------------------
-  - Percentages use TRUE current supply: sum(positive balances) + LP + burned
+  - Percentages use TRUE supply: minted − burned
   - LP shows as a purple bubble labeled "LP"
   - TG recipients ringed in gold; proxies auto-filtered from holders
-  - Stats: holders count, burn %, LP %, top10, bundles, etc.
+  - Stats show: holders count (full), burn %, LP %, top10, bundles, total supply, circulating (tracked)
 */
 
 (() => {
@@ -22,10 +22,13 @@
   const PROXY_END_BALANCE_EPS = 1e-12;
   const PROXY_OUTFLOW_SHARE = 0.90;
 
-  const burnAddresses = new Set([
-    "0x0000000000000000000000000000000000000000",
-    "0x000000000000000000000000000000000000dead"
-  ]);
+  // Burn + Mint sentinels
+  const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
+  const DEAD_ADDR = "0x000000000000000000000000000000000000dead";
+  const burnAddresses = new Set([ZERO_ADDR, DEAD_ADDR]);
+
+  // Render cap for performance
+  const RENDER_TOP_N = 500;
 
   window.showTokenHolders = async function showTokenHolders() {
     const contractEl = document.getElementById('tokenAddr');
@@ -76,10 +79,11 @@
           ? cData.result[0].contractCreator.toLowerCase() : '';
       } catch {}
 
-      // 4) Build balances/graph + burn + TG + proxy stats + LP balance
-      const balances = {};           // running balances for all addresses (except contract itself)
+      // 4) Build balances/graph + mint/burn + TG + proxy stats + LP balance
+      const balances = {};           // running balances for all addresses (except burns/contract)
       const connections = {};
       let burnedAmount = 0;
+      let mintedAmount = 0;
       let pairTokenBalance = 0;
 
       // Heuristics
@@ -92,7 +96,7 @@
 
       for (const tx of txs) {
         const decimals = parseInt(tx.tokenDecimal) || 18;
-        const amount = parseFloat(tx.value) / Math.pow(10, decimals);
+        const amount = Number(tx.value) / Math.pow(10, decimals);
         const from = (tx.from || tx.fromAddress).toLowerCase();
         const to   = (tx.to   || tx.toAddress).toLowerCase();
 
@@ -111,16 +115,14 @@
         // TG: tag recipients only
         if (from === TG_BOT_ADDRESS) tgRecipients.add(to);
 
-        // burn
-        if (burnAddresses.has(to)) burnedAmount += amount;
+        // minted / burned
+        if (from === ZERO_ADDR) mintedAmount += amount;            // mint
+        if (burnAddresses.has(to)) burnedAmount += amount;        // burn (to 0x0 or 0xdead)
 
-        // skip contract self-moves
+        // skip contract self-moves from %/circulating
         if (from === contract || to === contract) continue;
 
-        // NOTE: we do NOT skip pair here, because we want a truthful global supply later.
-        // We'll exclude the pair only when building the "holders" list for display.
-
-        // balances
+        // balances (exclude burn sinks)
         if (!burnAddresses.has(from)) balances[from] = (balances[from] || 0) - amount;
         if (!burnAddresses.has(to))   balances[to]   = (balances[to]   || 0) + amount;
 
@@ -150,17 +152,12 @@
         }
       }
 
-      // ---------- TRUE current supply ----------
-      // Sum of ALL positive balances (including pair/proxies/etc.) + burned
-      const sumPosBalances = Object.entries(balances)
-        .filter(([addr, bal]) => bal > 0 && addr !== contract)
-        .reduce((s, [, bal]) => s + bal, 0);
+      // ---------- SUPPLY BASE ----------
+      // TRUE supply for % = minted − burned
+      const totalSupply = Math.max(0, mintedAmount - burnedAmount);
 
-      const pairBalanceClamped = Math.max(0, pairTokenBalance);
-      const trueSupply = sumPosBalances + pairBalanceClamped + burnedAmount;
-
-      // ---------- Build display holders (exclude pair, proxies, burns, contract) ----------
-      const holders = Object.entries(balances)
+      // ---------- Circulating (tracked) ----------
+      const circulatingTracked = Object.entries(balances)
         .filter(([addr, bal]) =>
           bal > 0 &&
           addr !== contract &&
@@ -168,13 +165,35 @@
           !burnAddresses.has(addr) &&
           !proxyAddresses.has(addr)
         )
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 500)
+        .reduce((s, [, bal]) => s + bal, 0);
+
+      // ---------- Build holders (percentage uses totalSupply; list excludes LP, burn, proxies, contract) ----------
+      const allHoldersUnsorted = Object.entries(balances)
+        .filter(([addr, bal]) =>
+          bal > 0 &&
+          addr !== contract &&
+          (!pairAddress || addr !== pairAddress) &&
+          !burnAddresses.has(addr) &&
+          !proxyAddresses.has(addr)
+        )
         .map(([address, balance]) => ({ address, balance }));
 
-      // LP percent + Burn percent (now based on TRUE supply)
-      const lpPct = trueSupply > 0 ? (pairBalanceClamped / trueSupply) * 100 : 0;
-      const burnPct = trueSupply > 0 ? (burnedAmount / trueSupply) * 100 : 0;
+      // Count before slicing for UI
+      const fullHoldersCount = allHoldersUnsorted.length;
+
+      // Top N for rendering
+      const holders = allHoldersUnsorted
+        .sort((a, b) => b.balance - a.balance)
+        .slice(0, RENDER_TOP_N)
+        .map(h => ({
+          ...h,
+          pct: totalSupply ? (h.balance / totalSupply) * 100 : 0
+        }));
+
+      // LP percent + Burn percent (on totalSupply)
+      const lpTokens = Math.max(0, pairTokenBalance);
+      const lpPct = totalSupply > 0 ? (lpTokens / totalSupply) * 100 : 0;
+      const burnPct = totalSupply > 0 ? (burnedAmount / totalSupply) * 100 : 0;
 
       if (burnedAmount > 0) {
         pairInfoEl.innerHTML += `<span style="color:#ff4e4e">🔥 Burn — ${burnedAmount.toLocaleString()} tokens (${burnPct.toFixed(4)}% of supply)</span>`;
@@ -186,7 +205,7 @@
       for (const t of txs) {
         const from = (t.from || t.fromAddress).toLowerCase();
         const to   = (t.to   || t.toAddress).toLowerCase();
-        if (burnAddresses.has(from)) continue; // mint
+        if (from === ZERO_ADDR) continue; // mint
         if (!buyerSeen.has(to)) { buyerSeen.add(to); first20.push(t); }
         if (first20.length >= 20) break;
       }
@@ -226,15 +245,15 @@
         bundles[funder].add(buyer);
       }
 
-      const bundleTotals = Object.entries(bundles).map(([funder, set]) => {
+      const bundlesTotals = Object.entries(bundles).map(([funder, set]) => {
         const buyers = Array.from(set);
         const tokens = buyers.reduce((s, b) => s + (amountOnFirstBuy[b] || 0), 0);
-        const pct = trueSupply ? (tokens / trueSupply) * 100 : 0;
+        const pct = totalSupply ? (tokens / totalSupply) * 100 : 0;
         return { funder, buyers, tokens, pct };
       }).sort((a,b) => b.tokens - a.tokens);
 
-      const bundlesAggregateTokens = bundleTotals.reduce((s, b) => s + b.tokens, 0);
-      const bundlesAggregatePct = trueSupply ? (bundlesAggregateTokens / trueSupply) * 100 : 0;
+      const bundlesAggregateTokens = bundlesTotals.reduce((s, b) => s + b.tokens, 0);
+      const bundlesAggregatePct = totalSupply ? (bundlesAggregateTokens / totalSupply) * 100 : 0;
 
       // 8) First 20 buyers statuses (vs current balances)
       const first20Enriched = [];
@@ -255,10 +274,7 @@
       }
 
       // 9) Stats & render
-      const holdersWithPct = holders.map(h => ({
-        ...h,
-        pct: trueSupply ? (h.balance / trueSupply) * 100 : 0
-      }));
+      const holdersWithPct = holders; // already has pct based on totalSupply
 
       const top10Pct = holdersWithPct.slice().sort((a,b)=>b.pct-a.pct).slice(0,10).reduce((s,h)=>s+h.pct,0);
       const creatorPct = creatorAddress
@@ -275,23 +291,24 @@
       // Synthesize an LP node for display (purple)
       const lpNode = pairAddress ? [{
         address: pairAddress,
-        balance: Math.max(pairBalanceClamped, trueSupply * 0.000001 || 0.000001), // tiny if 0
-        pct: trueSupply ? (pairBalanceClamped / trueSupply) * 100 : 0,
+        balance: Math.max(lpTokens, totalSupply * 0.000001 || 0.000001), // tiny if 0
+        pct: totalSupply ? (lpTokens / totalSupply) * 100 : 0,
         __type: 'lp'
       }] : [];
 
       renderBubbleMap({
         holders: holdersWithPct,
         extras: lpNode,
-        trueSupply,
+        totalSupply,
+        circulatingTracked,
         addrToBundle,
         tgRecipients,
         stats: {
-          holdersCount: holdersWithPct.length,
+          holdersCount: fullHoldersCount,   // full count, not just top N
           top10Pct,
           creatorPct,
           creatorAddress,
-          lpTokens: pairBalanceClamped,
+          lpTokens: lpTokens,
           lpPct,
           burnedAmount,
           burnPct,
@@ -300,7 +317,7 @@
           bundlesCount: Object.keys(bundles).length,
           bundlesAggregateTokens,
           bundlesAggregatePct,
-          topBundles: bundleTotals.slice(0, 3)
+          topBundles: bundlesTotals.slice(0, 3)
         }
       });
     } catch (err) {
@@ -334,7 +351,7 @@
   }
 
   // Renderer
-  function renderBubbleMap({ holders, extras = [], trueSupply, addrToBundle, tgRecipients, stats }) {
+  function renderBubbleMap({ holders, extras = [], totalSupply, circulatingTracked, addrToBundle, tgRecipients, stats }) {
     const mapEl = document.getElementById('bubble-map');
     mapEl.innerHTML = '';
 
@@ -461,7 +478,9 @@
     statsDiv.style.marginTop = '10px';
     statsDiv.innerHTML = `
       <div class="section-title" style="padding-left:0">Stats</div>
-      <div>Holders: <strong>${stats.holdersCount}</strong></div>
+      <div>Total supply (minted − burned): <strong>${totalSupply.toLocaleString()}</strong> tokens</div>
+      <div>Circulating (tracked)*: <strong>${circulatingTracked.toLocaleString()}</strong> tokens</div>
+      <div>Holders (displayed / total): <strong>${holders.length}</strong> / <strong>${stats.holdersCount}</strong></div>
       <div>Top 10 holders: <strong>${stats.top10Pct.toFixed(4)}%</strong></div>
       <div>Creator (${stats.creatorAddress ? stats.creatorAddress.slice(0,6)+'...'+stats.creatorAddress.slice(-4) : 'n/a'}) holding:
         <strong>${stats.creatorPct.toFixed(4)}%</strong></div>
@@ -476,6 +495,7 @@
       <div style="margin-top:10px">Among first 20 buyers, <strong>${stats.lt10Count}</strong> have &lt; 10 token tx.</div>
       <div style="margin-top:8px">First 20 buyers status: ${legend}</div>
       <div style="opacity:.8;margin-top:6px">Purple bubble = LP • Gold ring = received tokens from TG bot</div>
+      <div style="opacity:.6;margin-top:6px;font-size:.9em">*Circulating (tracked) excludes LP, contract, burn sinks, and detected proxies.</div>
     `;
     mapEl.appendChild(statsDiv);
   }
