@@ -1,16 +1,21 @@
 /*
-  Totally ABS Bubble Viewer — v3
+  Totally ABS Bubble Viewer — v4 (adds VESTED bubbles)
   ------------------------------------------------------------------
-  - BigInt math everywhere; robust decimals inference
-  - Dexscreener multi-LP discovery; LP balances via tokenbalance()
+  - BigInt math + robust decimals inference
   - Full pagination for tokentx
+  - Multi-LP via Dexscreener, LP balances via tokenbalance (fallback to net)
+  - VESTED addresses: excluded from holders/circulating, shown as teal bubbles
   - Circulating (tracked) clamped ≤ (minted − burned)
-  - First 20 buyers legend restored
+  - First 20 buyers legend (Hold / Sold Part / Sold All / Bought More)
   - Early snipe / insider / TG / LP rings
-  - Top holders verified via explorer tokenbalance (override or drop)
-  - Known system/DEX/router contracts excluded from holders & circ
+  - Top holders cross-checked via tokenbalance; known system/proxy excluded
 
-  Color rings priority: red (snipe) > orange (insider) > gold (TG) > lilac (LP)
+  Bubble fills:
+    LP      = purple  (#8B5CF6)
+    VESTED  = teal    (#14B8A6)
+
+  Ring colors priority:
+    red (snipe) > orange (insider) > gold (TG) > lilac (LP) > mint (VESTED)
 */
 
 (() => {
@@ -22,14 +27,29 @@
 
   const TG_BOT_ADDRESS = "0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f".toLowerCase();
 
-  // Known system/router/aggregator/factory contracts on ABS you want to ignore as holders
+  // Known system/router/aggregator/factory contracts you want to ignore as holders
   const KNOWN_SYSTEM_ADDRESSES = new Set([
     TG_BOT_ADDRESS,
-    // Reported router-like/system address (should not appear as holder)
-    "0xcca5047e4c9f9d72f11c199b4ff1960f88a4748d".toLowerCase(),
-    // Add more if needed:
-    // "0x...", "0x..."
+    "0xcca5047e4c9f9d72f11c199b4ff1960f88a4748d".toLowerCase(), // router-like/system
   ]);
+
+  // Always exclude: addresses you *never* want counted as holders/circulating
+  const ALWAYS_EXCLUDE_ADDRESSES = new Set([
+    // keep empty if you plan to show some as VESTED bubbles instead
+  ]);
+
+  // VESTED addresses — excluded from holders/circulating, rendered as teal bubbles
+  // Option A: global list (applies to all tokens)
+  const VESTED_ADDRESSES_GLOBAL = new Set([
+    // "0x...".toLowerCase(),
+  ]);
+  // Option B: per-token list
+  const VESTED_ADDRESSES_BY_TOKEN = {
+    // Example from your message: vesting wallet for this token
+    "0xd5cc17f92b41d57a4b34d4b08587bf55342d4bc1": [
+      "0x1d48d1cb9b51dbed2443d7451eae1060ccc27ba8",
+    ],
+  };
 
   // Distributor / proxy detection
   const PROXY_MIN_DISTINCT_RECIPIENTS = 8;
@@ -38,14 +58,15 @@
   const PROXY_OUTFLOW_SHARE_DEN = 100n;
 
   // Early snipe / insider heuristics
-  const LAUNCH_WINDOW_SECS = 180;    // seconds after first LP add
+  const LAUNCH_WINDOW_SECS = 900;    // seconds after first LP add
   const EARLY_SNIPE_MIN_PCT = 0.20;  // ≥ 0.20% of current supply OR top-K
-  const EARLY_TOP_K = 10;            // top 10 early buys by size
+  const EARLY_TOP_K = 25;            // top 10 early buys by size
   const INSIDER_FUNDER_MIN = 3;      // funder bankrolls ≥3 early buyers
 
-  // Verify top N holders via explorer tokenbalance to override/drop bad classifications
+  // Verify top N holders via explorer tokenbalance
   const VERIFY_TOP_N = 150;
   const VERIFY_CONCURRENCY = 4;
+  const DROP_UNVERIFIED_TOP_HOLDERS = true;
 
   // Burns / mints
   const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
@@ -165,6 +186,25 @@
     return null;
   }
 
+  // ===== VERIFY TOP HOLDERS =====
+  async function verifyTopBalances(contract, addresses) {
+    const out = {};
+    let idx = 0;
+    async function worker() {
+      while (idx < addresses.length) {
+        const i = idx++;
+        const addr = addresses[i];
+        let v = null;
+        try { v = await tokenBalanceOf(contract, addr); }
+        catch {}
+        out[addr] = v; // BigInt or null
+      }
+    }
+    const workers = Array.from({length:VERIFY_CONCURRENCY}, worker);
+    await Promise.all(workers);
+    return out;
+  }
+
   // ===== MAIN =====
   window.showTokenHolders = async function showTokenHolders() {
     const contractEl = document.getElementById('tokenAddr');
@@ -200,6 +240,13 @@
     } catch(e){ console.warn('DexScreener fetch error:', e); }
     pairAddresses = Array.from(new Set(pairAddresses));
     const pairSet = new Set(pairAddresses);
+
+    // 1a) VESTED set for this token
+    const vestedList = new Set([
+      ...VESTED_ADDRESSES_GLOBAL,
+      ...(VESTED_ADDRESSES_BY_TOKEN[contract]?.map(a => a.toLowerCase()) || []),
+    ]);
+    const vestedSet = new Set(vestedList);
 
     try {
       // 2) All token transfers
@@ -254,8 +301,13 @@
         if (!burnAddresses.has(to))   balances[to]   = (balances[to]   || 0n) + units;
       }
 
-      // 5) Distributor/proxy detection
-      const proxyAddresses = new Set([...KNOWN_SYSTEM_ADDRESSES]); // start with known systems
+      // 5) Distributor/proxy detection + blocklists
+      const proxyAddresses = new Set([
+        ...KNOWN_SYSTEM_ADDRESSES,
+        ...ALWAYS_EXCLUDE_ADDRESSES,
+        ...vestedSet, // exclude vested from holders/circulating (we render as bubbles)
+      ]);
+
       for (const addr of Object.keys(sendRecipients)) {
         const recipients = sendRecipients[addr]?.size || 0;
         const endBal = balances[addr] || 0n;
@@ -290,7 +342,21 @@
       }
       const lpPct = currentSupply > 0n ? pctUnits(lpUnitsSum, currentSupply) : 0;
 
-      // 8) First pass holders (exclude LPs, contract, burn sinks, proxies/known systems)
+      // 7a) VESTED balances (per vested address)
+      const vestedPerAddr = [];
+      let vestedUnitsSum = 0n;
+      for (const va of vestedSet) {
+        let units = await tokenBalanceOf(contract, va);
+        if (units == null) {
+          units = balances[va] || 0n;
+          if (units < 0n) units = 0n;
+        }
+        vestedPerAddr.push({ address: va, units });
+        vestedUnitsSum += units;
+      }
+      const vestedPct = currentSupply > 0n ? pctUnits(vestedUnitsSum, currentSupply) : 0;
+
+      // 8) First pass holders (exclude LPs, VESTED, contract, burn sinks, proxies/known systems)
       let holderEntries = Object.entries(balances)
         .filter(([addr, bal]) =>
           bal > 0n &&
@@ -304,7 +370,7 @@
       // 9) VERIFY TOP HOLDERS via tokenbalance (override/drop)
       holderEntries.sort((a,b)=> (b.units > a.units) ? 1 : (b.units < a.units) ? -1 : 0);
       const toVerify = holderEntries.slice(0, VERIFY_TOP_N).map(h => h.address);
-      const verified = await verifyTopBalances(contract, toVerify); // map addr->BigInt|null
+      const verified = await verifyTopBalances(contract, toVerify);
 
       const verifiedSet = new Set(toVerify);
       const corrected = [];
@@ -312,14 +378,12 @@
         if (verifiedSet.has(h.address)) {
           const v = verified[h.address];
           if (v === null) {
-            // explorer didn’t answer -> keep computed
-            if (h.units > 0n) corrected.push(h);
+            if (DROP_UNVERIFIED_TOP_HOLDERS) continue; // drop if unverified
+            corrected.push(h);
           } else if (v === 0n) {
-            // explorer says zero -> drop
-            continue;
+            continue; // explorer says zero -> drop
           } else {
-            // override with explorer value
-            corrected.push({ address: h.address, units: v });
+            corrected.push({ address: h.address, units: v }); // override
           }
         } else {
           corrected.push(h);
@@ -327,7 +391,7 @@
       }
       holderEntries = corrected;
 
-      // 10) Recompute circulating (tracked) after verification, clamp
+      // 10) Circulating (tracked) after verification, clamp
       let circulatingTrackedUnits = holderEntries.reduce((s, h) => s + h.units, 0n);
       if (circulatingTrackedUnits > currentSupply) {
         console.warn('Circulating > currentSupply; clamping.', {
@@ -370,7 +434,7 @@
       for (const t of first20) {
         const addr = (t.to || t.toAddress).toLowerCase();
         const initialUnits = toBI(t.value);
-        const currentUnits = (balances[addr] || 0n) + 0n; // pre-verify balance view is fine for status
+        const currentUnits = (balances[addr] || 0n) + 0n;
         const txCount = tokenTxCount[addr] || 0;
         if (txCount < 10) lt10Count++;
         let status = 'hold';
@@ -417,7 +481,6 @@
         const funderByBuyer = {};
         const funderCounts = {};
         for (const buyer of earlyAddrs) {
-          // fetch native txs up to end of window & pick closest inbound funding
           const list = await fetchAllNativeTx(buyer, launchEnd);
           let best = null;
           const beforeWindow = launchStart - 3600;
@@ -465,11 +528,20 @@
         __label: `LP-${i+1}`
       }));
 
+      // VESTED nodes (render)
+      const vestedNodes = vestedPerAddr.map((v, i) => ({
+        address: v.address,
+        balance: toNum(v.units, tokenDecimals),
+        pct: currentSupply > 0n ? pctUnits(v.units, currentSupply) : 0,
+        __type: 'vested',
+        __label: vestedPerAddr.length === 1 ? 'VESTED' : `VESTED-${i+1}`
+      }));
+
       // Render
       renderBubbleMap({
         tokenDecimals,
         holders: holders.map(h => ({ address: h.address, balance: toNum(h.units, tokenDecimals), pct: h.pct })),
-        extras: lpNodes,
+        extras: [...lpNodes, ...vestedNodes],
         mintedUnits,
         burnedUnits,
         currentSupply,
@@ -478,6 +550,7 @@
         tgRecipients,
         addrFlags,
         lpPerPair,
+        vestedPerAddr,
         stats: {
           holdersCount: fullHoldersCount,
           top10Pct,
@@ -487,6 +560,8 @@
           lpPct,
           burnedUnits,
           burnPctVsMinted,
+          vestedUnitsSum,
+          vestedPct,
           first20Enriched,
           lt10Count,
           launchStart: firstLiquidityTs,
@@ -508,31 +583,11 @@
     }
   };
 
-  // ===== Verify top holders helper =====
-  async function verifyTopBalances(contract, addresses) {
-    // throttle tokenbalance calls
-    const out = {};
-    let idx = 0;
-    async function worker() {
-      while (idx < addresses.length) {
-        const i = idx++;
-        const addr = addresses[i];
-        let v = null;
-        try { v = await tokenBalanceOf(contract, addr); }
-        catch {}
-        out[addr] = v; // v can be BigInt or null
-      }
-    }
-    const workers = Array.from({length:VERIFY_CONCURRENCY}, worker);
-    await Promise.all(workers);
-    return out;
-  }
-
   // ===== RENDERER =====
   function renderBubbleMap({
     tokenDecimals, holders, extras = [],
     mintedUnits, burnedUnits, currentSupply, circulatingTrackedUnits,
-    addrToBundle, tgRecipients, addrFlags, lpPerPair, stats
+    addrToBundle, tgRecipients, addrFlags, lpPerPair, vestedPerAddr, stats
   }) {
     const mapEl = document.getElementById('bubble-map');
     mapEl.innerHTML = '';
@@ -560,13 +615,21 @@
         .style('pointer-events','none').style('opacity',0).style('z-index',9999);
     }
 
-    function ringColorFor(addr, isLP) {
-      if (isLP) return '#C4B5FD';           // lilac LP
+    function ringColorFor(addr, type) {
+      if (type === 'lp')     return '#C4B5FD';  // lilac
+      if (type === 'vested') return '#6EE7B7';  // mint
       const f = addrFlags[addr] || {};
-      if (f.snipe)   return '#ff4e4e';      // red
-      if (f.insider) return '#ff9f3c';      // orange
+      if (f.snipe)   return '#ff4e4e';  // red
+      if (f.insider) return '#ff9f3c';  // orange
       if (tgRecipients.has(addr)) return '#FFD700'; // gold
       return null;
+    }
+
+    function fillFor(d) {
+      if (d.data.__type === 'lp')     return '#8B5CF6'; // purple
+      if (d.data.__type === 'vested') return '#14B8A6'; // teal
+      const bundle = addrToBundle[d.data.address];
+      return bundle ? color(bundle) : '#4b5563';
     }
 
     const g = svg.selectAll('g')
@@ -577,29 +640,30 @@
 
     g.append('circle')
       .attr('r', d => d.r)
-      .attr('fill', d => {
-        if (d.data.__type === 'lp') return '#8B5CF6';
-        const bundle = addrToBundle[d.data.address];
-        return bundle ? color(bundle) : '#4b5563';
-      })
-      .attr('stroke', d => ringColorFor(d.data.address, d.data.__type === 'lp'))
-      .attr('stroke-width', d => ringColorFor(d.data.address, d.data.__type === 'lp') ? 2.5 : null)
+      .attr('fill', fillFor)
+      .attr('stroke', d => ringColorFor(d.data.address, d.data.__type))
+      .attr('stroke-width', d => ringColorFor(d.data.address, d.data.__type) ? 2.5 : null)
       .on('mouseover', function (event, d) {
-        const isLP = d.data.__type === 'lp';
         const bundle = addrToBundle[d.data.address];
         const flags = addrFlags[d.data.address] || {};
         const isTG = tgRecipients.has(d.data.address);
+        const isLP = d.data.__type === 'lp';
+        const isVested = d.data.__type === 'vested';
 
-        if (!isLP) {
+        if (!isLP && !isVested) {
           g.selectAll('circle')
             .attr('opacity', node => bundle ? (addrToBundle[node.data.address] === bundle ? 1 : 0.15) : 1)
-            .attr('stroke', node => ringColorFor(node.data.address, node.data.__type === 'lp'))
-            .attr('stroke-width', node => ringColorFor(node.data.address, node.data.__type === 'lp') ? 2.5 : null);
+            .attr('stroke', node => ringColorFor(node.data.address, node.data.__type))
+            .attr('stroke-width', node => ringColorFor(node.data.address, node.data.__type) ? 2.5 : null);
         }
 
         tip.html(
           isLP
             ? `<div><strong>${d.data.__label || 'LP'}</strong> — ${d.data.balance.toLocaleString()} tokens</div>
+               <div>${d.data.pct.toFixed(4)}% of current supply</div>
+               <div style="opacity:.8;margin-top:6px">Click to open in explorer ↗</div>`
+          : isVested
+            ? `<div><strong>${d.data.__label || 'VESTED'}</strong> — ${d.data.balance.toLocaleString()} tokens</div>
                <div>${d.data.pct.toFixed(4)}% of current supply</div>
                <div style="opacity:.8;margin-top:6px">Click to open in explorer ↗</div>`
             : `<div><strong>${d.data.pct.toFixed(4)}% of current supply</strong></div>
@@ -623,8 +687,8 @@
       .on('mouseout', function () {
         tip.style('opacity', 0);
         g.selectAll('circle').attr('opacity', 1)
-          .attr('stroke', d => ringColorFor(d.data.address, d.data.__type === 'lp'))
-          .attr('stroke-width', d => ringColorFor(d.data.address, d.data.__type === 'lp') ? 2.5 : null);
+          .attr('stroke', d => ringColorFor(d.data.address, d.data.__type))
+          .attr('stroke-width', d => ringColorFor(d.data.address, d.data.__type) ? 2.5 : null);
       })
       .on('click', (event, d) => {
         window.open(`${EXPLORER}/address/${d.data.address}`, '_blank');
@@ -636,9 +700,13 @@
       .style('font-size', d => Math.min(d.r * 0.5, 16))
       .style('fill', '#fff')
       .style('pointer-events', 'none')
-      .text(d => d.data.__type === 'lp' ? (d.data.__label || 'LP') : `${d.data.pct.toFixed(2)}%`);
+      .text(d => d.data.__type === 'lp'
+                  ? (d.data.__label || 'LP')
+                  : d.data.__type === 'vested'
+                    ? (d.data.__label || 'VESTED')
+                    : `${d.data.pct.toFixed(2)}%`);
 
-    // === Stats (incl. First 20 legend) ===
+    // === Stats (incl. First 20 legend + LP & VESTED sections) ===
     const legend = stats.first20Enriched.map(b => {
       const short = b.address.slice(0,6)+'...'+b.address.slice(-4);
       const clr = b.status === 'hold' ? '#00ff9c' :
@@ -660,6 +728,10 @@
       `<div>LP-${i+1} (${p.address.slice(0,6)}...${p.address.slice(-4)}): <strong>${(Number(p.units / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>`
     ).join('');
 
+    const vestedLines = vestedPerAddr.map((v, i) =>
+      `<div>${vestedPerAddr.length===1 ? 'VESTED' : `VESTED-${i+1}`} (${v.address.slice(0,6)}...${v.address.slice(-4)}): <strong>${(Number(v.units / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>`
+    ).join('');
+
     statsDiv.innerHTML = `
       <div class="section-title" style="padding-left:0">Stats</div>
       <div>Minted: <strong>${(Number(mintedUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>
@@ -671,15 +743,24 @@
       <div>Top 10 holders: <strong>${stats.top10Pct.toFixed(4)}%</strong> (of current supply)</div>
       <div>Creator (${stats.creatorAddress ? stats.creatorAddress.slice(0,6)+'...'+stats.creatorAddress.slice(-4) : 'n/a'}) holding:
         <strong>${stats.creatorPct.toFixed(4)}%</strong></div>
-      <div style="margin-top:8px"><strong>LP totals</strong> (sum across pools): <strong>${(Number(stats.lpUnitsSum / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens
+
+      <div style="margin-top:10px"><strong>LP totals</strong> (sum across pools):
+        <strong>${(Number(stats.lpUnitsSum / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens
         (<strong>${stats.lpPct.toFixed(4)}%</strong> of current supply)</div>
       ${lpLines}
+
+      <div style="margin-top:10px"><strong>Vested totals</strong>:
+        <strong>${(Number(stats.vestedUnitsSum / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens
+        (<strong>${stats.vestedPct.toFixed(4)}%</strong> of current supply)</div>
+      ${vestedLines}
+
       <div style="margin-top:10px">Among first 20 buyers, <strong>${stats.lt10Count}</strong> have &lt; 10 token tx.</div>
       <div style="margin-top:8px">First 20 buyers status: ${legend}</div>
       <div style="margin-top:8px"><strong>Launch window</strong>: ${stats.launchStart ? `${new Date(stats.launchStart*1000).toLocaleString()} + ${stats.launchWindowSecs}s` : 'n/a'}</div>
       <div>Snipe rule: ≥ ${stats.earlySnipeMinPct}% of supply or Top ${stats.earlyTopK} early buys</div>
-      <div style="opacity:.8;margin-top:6px">Rings — <span style="color:#ff4e4e">red</span>: snipe • <span style="color:#ff9f3c">orange</span>: insider • <span style="color:#FFD700">gold</span>: TG • <span style="color:#C4B5FD">lilac</span>: LP</div>
-      <div style="opacity:.6;margin-top:6px;font-size:.9em">*Circulating (tracked) excludes LPs, contract, burn sinks, detected distributors/proxies, and known system/router contracts.</div>
+
+      <div style="opacity:.8;margin-top:6px">Rings — <span style="color:#ff4e4e">red</span>: snipe • <span style="color:#ff9f3c">orange</span>: insider • <span style="color:#FFD700">gold</span>: TG • <span style="color:#C4B5FD">lilac</span>: LP • <span style="color:#6EE7B7">mint</span>: VESTED</div>
+      <div style="opacity:.6;margin-top:6px;font-size:.9em">*Circulating (tracked) excludes LPs, VESTED wallets, contract, burn sinks, and detected distributors/proxies/known system contracts.</div>
     `;
     mapEl.appendChild(statsDiv);
   }
