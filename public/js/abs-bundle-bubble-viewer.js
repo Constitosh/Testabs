@@ -1,5 +1,5 @@
 /*
-  ABS Bundle Bubble Viewer — correct supply %, LP bubble, TG + proxy filter
+  Totally ABS Bundle Bubble Viewer — correct supply %, LP bubble, TG + proxy filter
   ------------------------------------------------------------------------
   - Percentages use TRUE current supply: sum(positive balances) + LP + burned
   - LP shows as a purple bubble labeled "LP"
