@@ -1,10 +1,12 @@
 /*
-  Totally ABS Bundle Bubble Viewer — correct supply %, LP bubble, TG + proxy filter
-  ------------------------------------------------------------------------
-  - Percentages use TRUE supply: minted − burned
-  - LP shows as a purple bubble labeled "LP"
-  - TG recipients ringed in gold; proxies auto-filtered from holders
-  - Stats show: holders count (full), burn %, LP %, top10, bundles, total supply, circulating (tracked)
+  Totally ABS Bundle Bubble Viewer — FIXED precision, correct % bases, LP from balances
+  -------------------------------------------------------------------------------------
+  - All token math in BigInt (raw units). Convert only for UI.
+  - Burn % shown vs MINTED supply (correct).
+  - LP % shown vs CURRENT supply (minted − burned).
+  - LP balance read from final balances map (exact), not re-summed stream.
+  - Token decimals treated as constant (taken from first transfer).
+  - Bundles computed with exact units; no >100% artifacts.
 */
 
 (() => {
@@ -19,16 +21,58 @@
   // Proxy detection (auto) + small static list (TG bot included)
   const PROXY_BLOCKLIST = new Set([TG_BOT_ADDRESS]);
   const PROXY_MIN_DISTINCT_RECIPIENTS = 8;
-  const PROXY_END_BALANCE_EPS = 1e-12;
-  const PROXY_OUTFLOW_SHARE = 0.90;
+  const PROXY_END_BALANCE_EPS = 0n; // with BigInt units we can require 0 strictly
+  const PROXY_OUTFLOW_SHARE_NUM = 90n; // 90%
+  const PROXY_OUTFLOW_SHARE_DEN = 100n;
 
-  // Burn + Mint sentinels
   const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
   const DEAD_ADDR = "0x000000000000000000000000000000000000dead";
   const burnAddresses = new Set([ZERO_ADDR, DEAD_ADDR]);
 
-  // Render cap for performance
   const RENDER_TOP_N = 500;
+
+  // ---------- helpers ----------
+  function toUnitsBig(valueStr) {
+    // value is already in raw smallest units (Etherscan tokentx.value)
+    // but it may be a decimal string; use BigInt safely
+    return BigInt(valueStr);
+  }
+
+  function scaleToDecimalStr(unitsBI, decimals) {
+    // Convert BigInt units -> decimal string with up to 18 digits after dot (trimmed)
+    const neg = unitsBI < 0n;
+    const u = neg ? -unitsBI : unitsBI;
+    const base = 10n ** BigInt(decimals);
+    const intPart = u / base;
+    const fracPart = u % base;
+    if (fracPart === 0n) return (neg ? "-" : "") + intPart.toString();
+
+    // pad leading zeros in fractional part to length = decimals
+    let frac = fracPart.toString().padStart(decimals, "0");
+    // trim trailing zeros
+    frac = frac.replace(/0+$/, "");
+    return (neg ? "-" : "") + intPart.toString() + "." + frac;
+  }
+
+  function toNumber(unitsBI, decimals) {
+    // Only for UI and percentage math; safe because we bound precision when displaying
+    // Use string conversion to avoid JS float on huge ints, then parseFloat
+    return parseFloat(scaleToDecimalStr(unitsBI, decimals));
+  }
+
+  function pct(num, den) {
+    if (den === 0) return 0;
+    return (num / den) * 100;
+  }
+
+  // Safe div for ratios with BigInt (returns JS number percentage)
+  function pctUnits(numBI, denBI) {
+    if (denBI === 0n) return 0;
+    // scale to preserve precision
+    const SCALE = 1_000_000n;
+    const q = (numBI * SCALE) / denBI; // scaled ratio
+    return Number(q) / 10_000; // -> percentage with 2 decimals+ precision
+  }
 
   window.showTokenHolders = async function showTokenHolders() {
     const contractEl = document.getElementById('tokenAddr');
@@ -49,7 +93,7 @@
     pairInfoEl.innerHTML = '';
     mapEl.innerHTML = '<p>Loading data...</p>';
 
-    // 1) LP/Pair address
+    // 1) LP/Pair address (Dexscreener)
     let pairAddress = null;
     try {
       const pairRes = await fetch(`https://api.dexscreener.com/token-pairs/v1/abstract/${contract}`);
@@ -66,8 +110,13 @@
       const txUrl = `${BASE}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&startblock=0&endblock=99999999&sort=asc&apikey=${API_KEY}`;
       const txRes = await fetch(txUrl);
       const txData = await txRes.json();
-      if (!Array.isArray(txData?.result)) throw new Error('No transactions found for this contract.');
+      if (!Array.isArray(txData?.result) || txData.result.length === 0) {
+        throw new Error('No transactions found for this contract.');
+      }
       const txs = txData.result;
+
+      // Token decimals (treat as constant per token)
+      const tokenDecimals = Math.max(0, parseInt(txs[0].tokenDecimal || "18", 10) || 18);
 
       // 3) Creator address
       let creatorAddress = '';
@@ -79,52 +128,42 @@
           ? cData.result[0].contractCreator.toLowerCase() : '';
       } catch {}
 
-      // 4) Build balances/graph + mint/burn + TG + proxy stats + LP balance
-      const balances = {};           // running balances for all addresses (except burns/contract)
+      // 4) Build balances + supply + heuristics (BigInt units)
+      const balances = {};           // address -> BigInt
       const connections = {};
-      let burnedAmount = 0;
-      let mintedAmount = 0;
-      let pairTokenBalance = 0;
+      let burnedUnits = 0n;
+      let mintedUnits = 0n;
 
-      // Heuristics
       const sendRecipients = {}; // addr -> Set(to)
-      const inflow = {};         // addr -> tokens in
-      const outflow = {};        // addr -> tokens out
+      const inflow = {};         // addr -> BigInt in
+      const outflow = {};        // addr -> BigInt out
 
-      // TG recipients
       const tgRecipients = new Set();
 
       for (const tx of txs) {
-        const decimals = parseInt(tx.tokenDecimal) || 18;
-        const amount = Number(tx.value) / Math.pow(10, decimals);
         const from = (tx.from || tx.fromAddress).toLowerCase();
         const to   = (tx.to   || tx.toAddress).toLowerCase();
+        const units = toUnitsBig(tx.value); // raw token units (BigInt)
 
-        // Heuristic stats
+        // Heuristic stats (BigInt tracked)
         if (!sendRecipients[from]) sendRecipients[from] = new Set();
         sendRecipients[from].add(to);
-        inflow[to]    = (inflow[to]    || 0) + amount;
-        outflow[from] = (outflow[from] || 0) + amount;
+        inflow[to]    = (inflow[to]    || 0n) + units;
+        outflow[from] = (outflow[from] || 0n) + units;
 
-        // LP balance tracking
-        if (pairAddress) {
-          if (to === pairAddress)   pairTokenBalance += amount;
-          if (from === pairAddress) pairTokenBalance -= amount;
-        }
-
-        // TG: tag recipients only
+        // TG recipients
         if (from === TG_BOT_ADDRESS) tgRecipients.add(to);
 
-        // minted / burned
-        if (from === ZERO_ADDR) mintedAmount += amount;            // mint
-        if (burnAddresses.has(to)) burnedAmount += amount;        // burn (to 0x0 or 0xdead)
+        // minted / burned (units)
+        if (from === ZERO_ADDR) mintedUnits += units;
+        if (burnAddresses.has(to)) burnedUnits += units;
 
-        // skip contract self-moves from %/circulating
+        // skip contract self-moves from balances
         if (from === contract || to === contract) continue;
 
-        // balances (exclude burn sinks)
-        if (!burnAddresses.has(from)) balances[from] = (balances[from] || 0) - amount;
-        if (!burnAddresses.has(to))   balances[to]   = (balances[to]   || 0) + amount;
+        // balances (exclude burn sinks only)
+        if (!burnAddresses.has(from)) balances[from] = (balances[from] || 0n) - units;
+        if (!burnAddresses.has(to))   balances[to]   = (balances[to]   || 0n) + units;
 
         // graph
         if (!connections[from]) connections[from] = new Set();
@@ -137,66 +176,73 @@
       const proxyAddresses = new Set(PROXY_BLOCKLIST);
       for (const addr of Object.keys(sendRecipients)) {
         const recipients = sendRecipients[addr]?.size || 0;
-        const endBal = Math.abs(balances[addr] || 0);
-        const out = outflow[addr] || 0;
-        const inn = inflow[addr] || 0;
+        const endBal = balances[addr] || 0n;
+        const out = outflow[addr] || 0n;
+        const inn = inflow[addr] || 0n;
         const flow = out + inn;
-        const outShare = flow > 0 ? (out / flow) : 0;
 
-        if (
-          recipients >= PROXY_MIN_DISTINCT_RECIPIENTS &&
-          endBal <= PROXY_END_BALANCE_EPS &&
-          outShare >= PROXY_OUTFLOW_SHARE
-        ) {
+        // outShare >= 90% ?
+        const outShareOK = flow === 0n
+          ? false
+          : (out * PROXY_OUTFLOW_SHARE_DEN) >= (PROXY_OUTFLOW_SHARE_NUM * flow);
+
+        if (recipients >= PROXY_MIN_DISTINCT_RECIPIENTS &&
+            endBal === PROXY_END_BALANCE_EPS &&
+            outShareOK) {
           proxyAddresses.add(addr);
         }
       }
 
-      // ---------- SUPPLY BASE ----------
-      // TRUE supply for % = minted − burned
-      const totalSupply = Math.max(0, mintedAmount - burnedAmount);
+      // ---------- SUPPLY ----------
+      const minted = mintedUnits;                  // BigInt
+      const burned = burnedUnits;                  // BigInt
+      const currentSupply = minted >= burned ? (minted - burned) : 0n;
+
+      // ---------- LP balance (from final balances) ----------
+      let lpUnits = 0n;
+      if (pairAddress) {
+        lpUnits = balances[pairAddress] || 0n;
+        if (lpUnits < 0n) lpUnits = 0n; // clamp
+      }
 
       // ---------- Circulating (tracked) ----------
-      const circulatingTracked = Object.entries(balances)
+      const circulatingTrackedUnits = Object.entries(balances)
         .filter(([addr, bal]) =>
-          bal > 0 &&
+          bal > 0n &&
           addr !== contract &&
           (!pairAddress || addr !== pairAddress) &&
           !burnAddresses.has(addr) &&
           !proxyAddresses.has(addr)
         )
-        .reduce((s, [, bal]) => s + bal, 0);
+        .reduce((s, [, bal]) => s + bal, 0n);
 
-      // ---------- Build holders (percentage uses totalSupply; list excludes LP, burn, proxies, contract) ----------
+      // ---------- Holders list (exclude LP, burn, proxies, contract) ----------
       const allHoldersUnsorted = Object.entries(balances)
         .filter(([addr, bal]) =>
-          bal > 0 &&
+          bal > 0n &&
           addr !== contract &&
           (!pairAddress || addr !== pairAddress) &&
           !burnAddresses.has(addr) &&
           !proxyAddresses.has(addr)
         )
-        .map(([address, balance]) => ({ address, balance }));
+        .map(([address, units]) => ({ address, units }));
 
-      // Count before slicing for UI
       const fullHoldersCount = allHoldersUnsorted.length;
 
-      // Top N for rendering
       const holders = allHoldersUnsorted
-        .sort((a, b) => b.balance - a.balance)
+        .sort((a, b) => (b.units > a.units ? 1 : b.units < a.units ? -1 : 0))
         .slice(0, RENDER_TOP_N)
         .map(h => ({
           ...h,
-          pct: totalSupply ? (h.balance / totalSupply) * 100 : 0
+          pct: currentSupply > 0n ? pctUnits(h.units, currentSupply) : 0
         }));
 
-      // LP percent + Burn percent (on totalSupply)
-      const lpTokens = Math.max(0, pairTokenBalance);
-      const lpPct = totalSupply > 0 ? (lpTokens / totalSupply) * 100 : 0;
-      const burnPct = totalSupply > 0 ? (burnedAmount / totalSupply) * 100 : 0;
+      // ---------- Percentages ----------
+      const lpPct = currentSupply > 0n ? pctUnits(lpUnits, currentSupply) : 0;
+      const burnPctVsMinted = minted > 0n ? pctUnits(burned, minted) : 0; // correct base
 
-      if (burnedAmount > 0) {
-        pairInfoEl.innerHTML += `<span style="color:#ff4e4e">🔥 Burn — ${burnedAmount.toLocaleString()} tokens (${burnPct.toFixed(4)}% of supply)</span>`;
+      if (burned > 0n) {
+        pairInfoEl.innerHTML += `<span style="color:#ff4e4e">🔥 Burn — ${toNumber(burned, tokenDecimals).toLocaleString(undefined,{maximumFractionDigits:18})} tokens (${burnPctVsMinted.toFixed(4)}% of minted)</span>`;
       }
 
       // 6) First 20 buyers (exclude mints)
@@ -210,7 +256,6 @@
         if (first20.length >= 20) break;
       }
 
-      // Token tx counts per address
       const tokenTxCount = {};
       for (const t of txs) {
         const f = (t.from || t.fromAddress).toLowerCase();
@@ -219,23 +264,42 @@
         tokenTxCount[to] = (tokenTxCount[to] || 0) + 1;
       }
 
-      // 7) FUNDING-BASED BUNDLES (native transfers)
-      const firstBuyMeta = {};
+      // 7) FUNDING-BASED BUNDLES (native transfers near first buy)
+      //    Store the token UNITS at first buy for each of the first20 buyers
+      const amountOnFirstBuyUnits = {};
+      const firstBuyTsByBuyer = {};
       for (const t of first20) {
         const to = (t.to || t.toAddress).toLowerCase();
-        firstBuyMeta[to] = {
-          ts: Number(t.timeStamp),
-          dec: Number(t.tokenDecimal) || 18,
-          raw: Number(t.value)
-        };
+        amountOnFirstBuyUnits[to] = toUnitsBig(t.value); // raw units
+        firstBuyTsByBuyer[to] = Number(t.timeStamp);
+      }
+
+      async function findFunderNative(buyer, firstBuyTs) {
+        const url = `${BASE}?chainid=${CHAIN_ID}&module=account&action=txlist&address=${buyer}&startblock=0&endblock=99999999&sort=asc&apikey=${API_KEY}`;
+        try {
+          const r = await fetch(url);
+          const j = await r.json();
+          const list = Array.isArray(j?.result) ? j.result : [];
+          let best = null;
+          const beforeWindow = firstBuyTs - 3600;
+          const afterWindow  = firstBuyTs + 30;
+          for (const t of list) {
+            const ts = Number(t.timeStamp);
+            if (ts > afterWindow) break;
+            if ((t.to || '').toLowerCase() === buyer && BigInt(t.value || "0") > 0n) {
+              if (ts >= beforeWindow && ts <= afterWindow) best = t;
+              else if (ts < beforeWindow) best = t;
+            }
+          }
+          return best ? (best.from || '').toLowerCase() : null;
+        } catch {
+          return null;
+        }
       }
 
       const funderByBuyer = {};
-      const amountOnFirstBuy = {};
-      for (const buyer of Object.keys(firstBuyMeta)) {
-        const fm = firstBuyMeta[buyer];
-        amountOnFirstBuy[buyer] = fm.raw / Math.pow(10, fm.dec);
-        const funder = await findFunderNative(buyer, fm.ts);
+      for (const buyer of Object.keys(firstBuyTsByBuyer)) {
+        const funder = await findFunderNative(buyer, firstBuyTsByBuyer[buyer]);
         if (funder) funderByBuyer[buyer] = funder;
       }
 
@@ -247,34 +311,34 @@
 
       const bundlesTotals = Object.entries(bundles).map(([funder, set]) => {
         const buyers = Array.from(set);
-        const tokens = buyers.reduce((s, b) => s + (amountOnFirstBuy[b] || 0), 0);
-        const pct = totalSupply ? (tokens / totalSupply) * 100 : 0;
-        return { funder, buyers, tokens, pct };
-      }).sort((a,b) => b.tokens - a.tokens);
+        const tokensUnits = buyers.reduce((s, b) => s + (amountOnFirstBuyUnits[b] || 0n), 0n);
+        const pctOfCurrent = currentSupply > 0n ? pctUnits(tokensUnits, currentSupply) : 0;
+        return { funder, buyers, tokensUnits, pctOfCurrent };
+      }).sort((a,b) => (b.tokensUnits > a.tokensUnits ? 1 : b.tokensUnits < a.tokensUnits ? -1 : 0));
 
-      const bundlesAggregateTokens = bundlesTotals.reduce((s, b) => s + b.tokens, 0);
-      const bundlesAggregatePct = totalSupply ? (bundlesAggregateTokens / totalSupply) * 100 : 0;
+      const bundlesAggregateUnits = bundlesTotals.reduce((s, b) => s + b.tokensUnits, 0n);
+      const bundlesAggregatePctOfCurrent = currentSupply > 0n ? pctUnits(bundlesAggregateUnits, currentSupply) : 0;
 
       // 8) First 20 buyers statuses (vs current balances)
       const first20Enriched = [];
       let lt10Count = 0;
       for (const t of first20) {
         const addr = (t.to || t.toAddress).toLowerCase();
-        const initial = (Number(t.value) / Math.pow(10, Number(t.tokenDecimal) || 18)) || 0;
-        const current = balances[addr] || 0;
+        const initialUnits = toUnitsBig(t.value);
+        const currentUnits = balances[addr] || 0n;
         const txCount = tokenTxCount[addr] || 0;
         if (txCount < 10) lt10Count++;
 
         let status = 'hold';
-        if (current === 0) status = 'soldAll';
-        else if (current > initial) status = 'more';
-        else if (current < initial) status = 'soldPart';
+        if (currentUnits === 0n) status = 'soldAll';
+        else if (currentUnits > initialUnits) status = 'more';
+        else if (currentUnits < initialUnits) status = 'soldPart';
 
         first20Enriched.push({ address: addr, status });
       }
 
       // 9) Stats & render
-      const holdersWithPct = holders; // already has pct based on totalSupply
+      const holdersWithPct = holders;
 
       const top10Pct = holdersWithPct.slice().sort((a,b)=>b.pct-a.pct).slice(0,10).reduce((s,h)=>s+h.pct,0);
       const creatorPct = creatorAddress
@@ -291,32 +355,35 @@
       // Synthesize an LP node for display (purple)
       const lpNode = pairAddress ? [{
         address: pairAddress,
-        balance: Math.max(lpTokens, totalSupply * 0.000001 || 0.000001), // tiny if 0
-        pct: totalSupply ? (lpTokens / totalSupply) * 100 : 0,
+        units: lpUnits,
+        pct: currentSupply > 0n ? pctUnits(lpUnits, currentSupply) : 0,
         __type: 'lp'
       }] : [];
 
       renderBubbleMap({
-        holders: holdersWithPct,
-        extras: lpNode,
-        totalSupply,
-        circulatingTracked,
+        tokenDecimals,
+        holders: holdersWithPct.map(h => ({ address: h.address, balance: toNumber(h.units, tokenDecimals), pct: h.pct })),
+        extras: lpNode.map(n => ({ address: n.address, balance: toNumber(n.units, tokenDecimals), pct: n.pct, __type: 'lp' })),
+        mintedUnits,
+        burnedUnits,
+        currentSupply,
+        circulatingTrackedUnits,
         addrToBundle,
         tgRecipients,
         stats: {
-          holdersCount: fullHoldersCount,   // full count, not just top N
+          holdersCount: fullHoldersCount,
           top10Pct,
           creatorPct,
           creatorAddress,
-          lpTokens: lpTokens,
+          lpUnits,
           lpPct,
-          burnedAmount,
-          burnPct,
+          burnedUnits,
+          burnPctVsMinted,
           first20Enriched,
           lt10Count,
           bundlesCount: Object.keys(bundles).length,
-          bundlesAggregateTokens,
-          bundlesAggregatePct,
+          bundlesAggregateUnits,
+          bundlesAggregatePctOfCurrent,
           topBundles: bundlesTotals.slice(0, 3)
         }
       });
@@ -326,32 +393,8 @@
     }
   };
 
-  // Native funder near first buy
-  async function findFunderNative(buyer, firstBuyTs) {
-    const url = `${BASE}?chainid=${CHAIN_ID}&module=account&action=txlist&address=${buyer}&startblock=0&endblock=99999999&sort=asc&apikey=${API_KEY}`;
-    try {
-      const r = await fetch(url);
-      const j = await r.json();
-      const list = Array.isArray(j?.result) ? j.result : [];
-      let best = null;
-      const beforeWindow = firstBuyTs - 3600;
-      const afterWindow  = firstBuyTs + 30;
-      for (const t of list) {
-        const ts = Number(t.timeStamp);
-        if (ts > afterWindow) break;
-        if ((t.to || '').toLowerCase() === buyer && Number(t.value) > 0) {
-          if (ts >= beforeWindow && ts <= afterWindow) best = t;
-          else if (ts < beforeWindow) best = t;
-        }
-      }
-      return best ? (best.from || '').toLowerCase() : null;
-    } catch {
-      return null;
-    }
-  }
-
-  // Renderer
-  function renderBubbleMap({ holders, extras = [], totalSupply, circulatingTracked, addrToBundle, tgRecipients, stats }) {
+  // Renderer (unchanged visually; accepts numbers for balances/pcts and BigInt-derived stats converted inside)
+  function renderBubbleMap({ tokenDecimals, holders, extras = [], mintedUnits, burnedUnits, currentSupply, circulatingTrackedUnits, addrToBundle, tgRecipients, stats }) {
     const mapEl = document.getElementById('bubble-map');
     mapEl.innerHTML = '';
 
@@ -419,10 +462,10 @@
 
         tip.html(
           isLP
-            ? `<div><strong>LP</strong> — ${stats.lpTokens.toLocaleString()} tokens</div>
-               <div>${stats.lpPct.toFixed(4)}% of supply</div>
+            ? `<div><strong>LP</strong> — ${Number(stats.lpUnits / (10n ** BigInt(tokenDecimals)))} tokens</div>
+               <div>${stats.lpPct.toFixed(4)}% of current supply</div>
                <div style="opacity:.8;margin-top:6px">Click to open in explorer ↗</div>`
-            : `<div><strong>${d.data.pct.toFixed(4)}% of supply</strong></div>
+            : `<div><strong>${d.data.pct.toFixed(4)}% of current supply</strong></div>
                <div>${d.data.balance.toLocaleString()} tokens</div>
                <div>${d.data.address.slice(0,6)}...${d.data.address.slice(-4)}</div>
                ${bundle ? `<div style="opacity:.8">Bundle funder: ${bundle.slice(0,6)}...${bundle.slice(-4)}</div>` : ''}
@@ -471,26 +514,27 @@
     }).join('');
 
     const topBundlesHtml = stats.topBundles.map(b =>
-      `<div>Bundle ${b.funder.slice(0,6)}...${b.funder.slice(-4)}: ${b.tokens.toLocaleString()} tokens (${b.pct.toFixed(4)}%) across ${b.buyers.length} wallets</div>`
+      `<div>Bundle ${b.funder.slice(0,6)}...${b.funder.slice(-4)}: ${(Number(b.tokensUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()} tokens (${b.pctOfCurrent.toFixed(4)}%) across ${b.buyers.length} wallets</div>`
     ).join('');
 
     const statsDiv = document.createElement('div');
     statsDiv.style.marginTop = '10px';
     statsDiv.innerHTML = `
       <div class="section-title" style="padding-left:0">Stats</div>
-      <div>Total supply (minted − burned): <strong>${totalSupply.toLocaleString()}</strong> tokens</div>
-      <div>Circulating (tracked)*: <strong>${circulatingTracked.toLocaleString()}</strong> tokens</div>
+      <div>Minted: <strong>${(Number(mintedUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>
+      <div>🔥 Burn: <strong>${(Number(burnedUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens
+        (<strong>${stats.burnPctVsMinted.toFixed(4)}%</strong> of minted)</div>
+      <div>Current supply (minted − burned): <strong>${(Number(currentSupply / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>
+      <div>Circulating (tracked)*: <strong>${(Number(circulatingTrackedUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>
       <div>Holders (displayed / total): <strong>${holders.length}</strong> / <strong>${stats.holdersCount}</strong></div>
-      <div>Top 10 holders: <strong>${stats.top10Pct.toFixed(4)}%</strong></div>
+      <div>Top 10 holders: <strong>${stats.top10Pct.toFixed(4)}%</strong> (of current supply)</div>
       <div>Creator (${stats.creatorAddress ? stats.creatorAddress.slice(0,6)+'...'+stats.creatorAddress.slice(-4) : 'n/a'}) holding:
         <strong>${stats.creatorPct.toFixed(4)}%</strong></div>
-      <div>LP balance: <strong>${stats.lpTokens.toLocaleString()}</strong> tokens
-        (<strong>${stats.lpPct.toFixed(4)}%</strong> of supply)</div>
-      <div>🔥 Burn: <strong>${stats.burnedAmount.toLocaleString()}</strong> tokens
-        (<strong>${stats.burnPct.toFixed(4)}%</strong> of supply)</div>
+      <div>LP balance: <strong>${(Number(stats.lpUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens
+        (<strong>${stats.lpPct.toFixed(4)}%</strong> of current supply)</div>
       <div>Bundles detected: <strong>${stats.bundlesCount}</strong> main funders</div>
-      <div>Bundles bought: <strong>${stats.bundlesAggregateTokens.toLocaleString()}</strong> tokens
-        (<strong>${stats.bundlesAggregatePct.toFixed(4)}%</strong> of supply)</div>
+      <div>Bundles bought (first 20): <strong>${(Number(stats.bundlesAggregateUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens
+        (<strong>${stats.bundlesAggregatePctOfCurrent.toFixed(4)}%</strong> of current supply)</div>
       ${topBundlesHtml ? `<div style="margin-top:6px">${topBundlesHtml}</div>` : ''}
       <div style="margin-top:10px">Among first 20 buyers, <strong>${stats.lt10Count}</strong> have &lt; 10 token tx.</div>
       <div style="margin-top:8px">First 20 buyers status: ${legend}</div>
