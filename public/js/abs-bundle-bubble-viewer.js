@@ -41,6 +41,8 @@
   const KNOWN_SYSTEM_ADDRESSES = new Set([
     TG_BOT_ADDRESS,
     "0xcca5047e4c9f9d72f11c199b4ff1960f88a4748d".toLowerCase(), // router-like/system
+ "0x47D70E83e92d8305DD727893013209D2Bd90f4D2".toLowerCase(),
+ "0xa44bd631aA0994fEe39D72e1356889aB55984874".toLowerCase()
   ]);
 
   // Always exclude (never count as holder/circulating)
