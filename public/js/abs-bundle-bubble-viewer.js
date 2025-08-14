@@ -922,9 +922,10 @@
       ${vestedLines}
 
       <div style="margin-top:12px"><strong>First 20 buyers (status)</strong></div>
+      <div style="opacity:.8;margin-top:10px">Dots — <span style="color:#53ff98">green</span>: Hold • <span style="color:#fbd73f">yellow</span>: Bought more • <span style="color:#5ea4ff">blue</span>: Sold part • <span style="color:#f54c4a">red</span>: Sold all</div>
       ${legendMatrix}
 
-      <div style="opacity:.8;margin-top:10px">Rings — <span style="color:#ff4e4e">red</span>: snipe • <span style="color:#ff9f3c">orange</span>: insider • <span style="color:#22d3ee">cyan</span>: via proxy • <span style="color:#FFD700">gold</span>: TelegramBot • <span style="color:#C4B5FD">lila</span>: LP • <span style="color:#6EE7B7">mint</span>: VESTED</div>
+      <div style="opacity:.8;margin-top:10px">Rings — <span style="color:#ff4e4e">red</span>: snipe • <span style="color:#ff9f3c">orange</span>: insider • <span style="color:#22d3ee">cyan</span>: via proxy • <span style="color:#FFD700">gold</span>: Looter • <span style="color:#C4B5FD">lila</span>: LP • <span style="color:#6EE7B7">mint</span>: VESTED</div>
       <div style="opacity:.6;margin-top:6px;font-size:.9em">*Circulating (tracked) excludes LPs, VESTED wallets, contract, burn sinks, detected distributors/proxies/known system contracts. Proxies are split to leaf holders when identified.</div>
     `;
     mapEl.appendChild(statsDiv);
