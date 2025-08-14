@@ -13,7 +13,7 @@
   
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Totally ABS Tool</title>
+  <title>The totally ABS Tool</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -123,17 +123,38 @@
   .legend { display:flex; align-items:center; gap:14px; margin-top:.5rem; flex-wrap:wrap; opacity:.9;}
   .legend .item { display:inline-flex; align-items:center; gap:6px; font-size:.85rem; color:#ccc; }
 
+.image-container {
+    text-align: center; /* centers inline elements like <img> */
+    margin-top: 20px;    /* optional spacing */
+  }
+
+  .image-container img {
+    width: 200px;        /* adjust size */
+    height: auto;        /* keeps aspect ratio */
+  }
+
   </style>
 </head>
 <body>
 
   <!-- Banner placeholder -->
-  <h1>$TABS</h1>
-  <h2>The Totally ABS Wallet & CA Tool</h2>
-  <div>
-  <p><strong style="color:#00ff9c;">Totally ABS</strong> is your go-to place to check any ABS wallet or Token CA.</p>
 
-  <p>Powered by <strong>$TABS</strong>, it’s built to give you a <strong>crystal-clear view</strong> of what’s happening in the ABS ecosystem.</p>
+<div class="image-container">
+  <img src="https://files.thefakerug.com/tabs/pfp_V2.png" alt="My Image">
+</div>
+
+  <h1>$tABS</h1>
+  <h2>The totally ABS Wallet & CA Tool</h2>
+
+<p style="font-size:1rem;color:#777;margin-top:0.1rem;">
+  This is the <a href="https://www.twitter.com/totally_abs" target="_blank" style="color:#00ff9c;text-decoration:none;">official Twitter</a> and
+ <a href="https://t.me/totally_ABS" target="_blank" style="color:#00ff9c;text-decoration:none;">official Telegram</a>
+
+
+  <div>
+  <p><strong style="color:#00ff9c;">totally ABS</strong> is your go-to place to check any ABS wallet or Token CA.</p>
+
+  <p>Powered by <strong>$tABS</strong>, it’s built to give you a <strong>crystal-clear view</strong> of what’s happening in the ABS ecosystem.</p>
 
   <p>Hate rugs? <strong>So do we.</strong><br>
   That’s why we built this tool. We’ve already covered the backend and hosting costs upfront, and we’re not here to dump our holdings on you.</p>
@@ -141,9 +162,14 @@
   <p>We believe in <strong>transparency</strong> — just like you.<br>
   If we ever need to sell any of our holdings (for things like R&amp;D, API tiers, or platform upgrades), we’ll give the community a heads-up before it happens.</p>
 
-  <p style="margin-top:1.2rem;font-size:0.95rem;color:#bbb;">
-    The service is <strong style="color:#00ff9c;">free to use for now</strong>, but in the future access may require holding $TABS tokens.
-  </p>
+  <p>Please be aware, <strong>no promises, no roadmap,</strong> just try it.
+</p>
+
+ <p style="margin-top:1.2rem;font-size:0.95rem;color:#bbb;">
+The service can handle <strong style="color:#00ff9c;">up to 500 token scans per day</strong> and is <strong style="color:#00ff9c;">free to use for now</strong>, but future access may require holding $tABS tokens.<br>
+If you hit the Rate-limit (5 requests/sec) try again.</p>
+
+
 </div>
   <!-- Token CA input + bubble map button -->
   <input id="tokenAddr" placeholder="Paste token contract address for Bubble Map" />
@@ -327,11 +353,13 @@
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <!-- Bubble viewer code -->
 <script src="/js/abs-bundle-bubble-viewer.js"></script>
-<p style="font-size:0.8rem;color:#777;margin-top:2rem;">
-  by the <a href="https://www.twitter.com/totally_abs" target="_blank" style="color:#00ff9c;text-decoration:none;">Totally ABS Team 2025</a>,  
-  All graphics by
-  <a href="https://twitter.com/wa666mr" target="_blank" style="color:#00ff9c;text-decoration:none;">WaWa</a>.
-<p style="font-size:0.8rem;color:#777;margin-top:2rem;">
+
+<p style="font-size:0.8rem;color:#777;margin-top:1rem;">
+  by the <a href="https://www.twitter.com/totally_abs" target="_blank" style="color:#00ff9c;text-decoration:none;">totally ABS Team</a> 2025,  
+  All graphics by <a href="https://twitter.com/wa666mr" target="_blank" style="color:#00ff9c;text-decoration:none;">WaWa</a>.
+</p>
+
+<p style="font-size:0.8rem;color:#777;margin-top:0.2rem;">
   This site uses <a href="https://d3js.org/" target="_blank" style="color:#00ff9c;text-decoration:none;">D3.js</a>,  
   © 2010–2025 Mike Bostock. Released under the 
   <a href="https://opensource.org/licenses/BSD-3-Clause" target="_blank" style="color:#00ff9c;text-decoration:none;">BSD 3-Clause License</a>.
