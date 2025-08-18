@@ -1,15 +1,15 @@
-
 /*
-  Totally ABS Bubble Viewer — v5.7 (no .env)
+  Totally ABS Bubble Viewer — v5.9 (no .env)
   ------------------------------------------------------------
-  • First buyers: up to FIRST_BUYERS_LIMIT (=25) unique buyers
-    - scans every tx with LP→* transfers
-    - considers ALL LP→X seeds per tx (largest first)
-    - resolves router/aggregator hops within the tx to the final wallet
-    - strict chronological order (time, block, logIndex)
-  • Matrix: status colors + rich hover with tokens, % of current supply, and a progress bar
-  • UI: three collapsible sections: Bubble Map, Stats, Top 25 Holders
-  • Stats order: Minted Tokens, Burned Tokens, Vested Tokens, Holders, Creator, Top 10 Holders
+  • First buyers = up to FIRST_BUYERS_LIMIT (=25) unique wallets
+    - Per tx: consider ALL LP→X seeds (largest first)
+    - In-tx hop-through: LP → router/aggregator → final wallet
+    - Cross-tx chase: if the seed is a proxy/bot, follow its OUT transfers
+      within a short time window to find the first real recipient
+  • Buyers matrix: Hold=green / Sold part=blue / Bought more=yellow / Sold all=red
+    Hover shows only percentages of current supply + a progress bar (current vs initial)
+  • UI: three collapsible sections: Bubble Map / Stats / Top 25 Holders
+  • Stats order: Minted → Burned → Vested → Holders → Creator → Top 10 Holders
 */
 
 (() => {
@@ -50,6 +50,8 @@
   // First buyers
   const FIRST_BUYERS_LIMIT   = 25;
   const FIRST_MATRIX_COLS    = 5; // 5 x 5 grid for 25
+  const CROSS_TX_WINDOW_SEC  = 300; // chase proxy fan-outs within 5 minutes
+  const CROSS_TX_MAX_DEPTH   = 4;
 
   // Burns / mints
   const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
@@ -146,7 +148,23 @@
     return null;
   }
 
-  // ===== FIRST N REAL BUYS (LP → router hop-through → final) =====
+  // ===== INDEXES FOR CROSS-TX CHASE =====
+  function buildOutgoingIndex(txs) {
+    // fromAddr -> [{ts, to, valueBI, hash}]
+    const out = new Map();
+    for (const t of txs) {
+      const f = (t.from || t.fromAddress).toLowerCase();
+      const to = (t.to || t.toAddress).toLowerCase();
+      const ts = Number(t.timeStamp) || 0;
+      const v  = toBI(t.value || "0");
+      if (!out.has(f)) out.set(f, []);
+      out.get(f).push({ ts, to, v, hash: String(t.hash || t.transactionHash || "") });
+    }
+    for (const arr of out.values()) arr.sort((a,b)=> a.ts - b.ts);
+    return out;
+  }
+
+  // ===== FIRST N REAL BUYS =====
   function groupByHashAscending(txs) {
     const groups = new Map();
     for (const t of txs) {
@@ -195,15 +213,32 @@
     if (!excluded.has(seed) && !pairSet.has(seed) && !burnAddresses.has(seed)) return seed;
     return null;
   }
-  function sumCreditsToInTx(group, addr) {
-    let sum = 0n;
-    for (const t of group) {
-      const to = (t.to || t.toAddress).toLowerCase();
-      if (to === addr) sum += toBI(t.value);
+  function resolveFinalRecipientCrossTx(seed, seedTs, { excluded, pairSet, outIdx, windowSec = CROSS_TX_WINDOW_SEC, maxDepth = CROSS_TX_MAX_DEPTH }) {
+    // Follow OUT transfers from seed → ... within a time window to find first non-excluded end wallet
+    let depth = 0;
+    let cur = seed;
+    let curTs = seedTs;
+    const seen = new Set([seed]);
+    while (depth < maxDepth) {
+      const outs = outIdx.get(cur) || [];
+      // first out after curTs, within window
+      const next = outs.find(o => o.ts >= curTs && o.ts <= curTs + windowSec);
+      if (!next) break;
+      const cand = next.to;
+      if (!excluded.has(cand) && !pairSet.has(cand) && !burnAddresses.has(cand)) {
+        return cand;
+      }
+      if (seen.has(cand)) break;
+      seen.add(cand);
+      cur = cand;
+      curTs = next.ts;
+      depth++;
     }
-    return sum;
+    // fallback: if seed itself is acceptable, treat as buyer
+    if (!excluded.has(seed) && !pairSet.has(seed) && !burnAddresses.has(seed)) return seed;
+    return null;
   }
-  function findFirstNRealBuys({txs, pairSet, excluded, limit}) {
+  function findFirstNRealBuys({txs, pairSet, excluded, outIdx, limit}) {
     const groups = groupByHashAscending(txs);
     const buyers = [];
     const seen = new Set();
@@ -220,10 +255,29 @@
 
       for (const seedT of lpTransfers) {
         const seed = (seedT.to || seedT.toAddress).toLowerCase();
-        const resolved = resolveFinalRecipientInTx(group, seed, {excluded, pairSet, maxDepth: 4});
+        const seedTs = Number(seedT.timeStamp) || Number(group[0].timeStamp) || 0;
+
+        // First try in-tx hop-through
+        let resolved = resolveFinalRecipientInTx(group, seed, {excluded, pairSet, maxDepth: 4});
+
+        // If unresolved or excluded proxy, try cross-tx chase
+        if (!resolved || excluded.has(resolved)) {
+          resolved = resolveFinalRecipientCrossTx(seed, seedTs, { excluded, pairSet, outIdx });
+        }
+
         if (!resolved || seen.has(resolved)) continue;
 
-        const credit = sumCreditsToInTx(group, resolved);
+        // Credit = sum of transfers to resolved within THIS tx (if any), otherwise earliest cross-tx credit
+        let credit = 0n;
+        for (const t of group) {
+          const to = (t.to || t.toAddress).toLowerCase();
+          if (to === resolved) credit += toBI(t.value || "0");
+        }
+        if (credit === 0n) {
+          const outs = outIdx.get(seed) || [];
+          const hop = outs.find(o => o.to === resolved && o.ts >= seedTs && o.ts <= seedTs + CROSS_TX_WINDOW_SEC);
+          if (hop) credit = hop.v;
+        }
         if (credit === 0n) continue;
 
         buyers.push({
@@ -348,7 +402,7 @@
         if (!burnAddresses.has(to))   balances[to]   = (balances[to]   || 0n) + units;
       }
 
-      // Exclusion set
+      // Exclusion set (for holders + first buyers)
       const excluded = new Set([
         ...KNOWN_SYSTEM_ADDRESSES,
         ...ALWAYS_EXCLUDE_ADDRESSES,
@@ -369,6 +423,9 @@
           excluded.add(addr);
         }
       }
+
+      // Build outgoing index for cross-tx chase
+      const outIdx = buildOutgoingIndex(txs);
 
       // Supply
       const minted = mintedUnits;
@@ -437,15 +494,19 @@
         .map(h => ({ ...h, pct: currentSupply > 0n ? pctUnits(h.units, currentSupply) : 0 }));
 
       const fullHoldersCount = holderEntries.length;
+      const displayedHolders = holders.length;
       const burnPctVsMinted   = minted > 0n ? pctUnits(burned, minted) : 0;
 
       // ===== First N real buys + enriched for matrix =====
-      const firstN = findFirstNRealBuys({ txs, pairSet, excluded: new Set([...excluded, contract]), limit: FIRST_BUYERS_LIMIT });
+      const firstN = findFirstNRealBuys({
+        txs, pairSet, excluded: new Set([...excluded, contract]), outIdx, limit: FIRST_BUYERS_LIMIT
+      });
 
       const firstNEnriched = firstN.map((b) => {
         const addr = b.address;
         const initialUnits = b.initialUnits;               // BigInt
-        const currentUnits = (balances[addr] || 0n);       // BigInt
+        const currentUnitsRaw = (balances[addr] || 0n);
+        const currentUnits = currentUnitsRaw > 0n ? currentUnitsRaw : 0n; // no negatives in UI
 
         // Status
         let status = 'hold';
@@ -458,19 +519,19 @@
         const boughtUnits = (currentUnits > initialUnits) ? (currentUnits - initialUnits) : 0n;
 
         // Pcts (vs current supply)
-        const initPct   = currentSupply > 0n ? pctUnits(initialUnits, currentSupply) : 0;
-        const soldPct   = currentSupply > 0n ? pctUnits(soldUnits,   currentSupply) : 0;
-        const boughtPct = currentSupply > 0n ? pctUnits(boughtUnits, currentSupply) : 0;
+        const initPct    = currentSupply > 0n ? pctUnits(initialUnits, currentSupply) : 0;
+        const soldPct    = currentSupply > 0n ? pctUnits(soldUnits,   currentSupply) : 0;
+        const boughtPct  = currentSupply > 0n ? pctUnits(boughtUnits, currentSupply) : 0;
+        const currentPct = currentSupply > 0n ? pctUnits(currentUnits, currentSupply) : 0;
 
-        // Progress (current vs initial)
+        // Progress (current vs initial), clamp 0..200 (so "more" can exceed 100)
         const progressPct = initialUnits === 0n ? 0 : clamp(Number((currentUnits * 10000n) / (initialUnits === 0n ? 1n : initialUnits)) / 100, 0, 200);
 
         return {
           address: addr,
           status,
           ts: b.ts,
-          initialUnits, currentUnits, soldUnits, boughtUnits,
-          initPct, soldPct, boughtPct,
+          currentPct, initPct, soldPct, boughtPct,
           progressPct
         };
       });
@@ -507,6 +568,7 @@
         lpPerPair, vestedPerAddr,
         stats: {
           holdersCount: fullHoldersCount,
+          displayedHolders,
           top10Pct: holders.slice(0,10).reduce((s,h)=>s+h.pct,0),
           creatorPct: (creatorAddress ? (holders.find(h => h.address.toLowerCase() === creatorAddress)?.pct || 0) : 0),
           creatorAddress,
@@ -564,7 +626,7 @@
 
     renderBubble({ root: root.querySelector('#bubble-canvas'), holders, extras, tgRecipients });
     renderStats({ el: root.querySelector('#stats-body'), tokenDecimals, mintedUnits, burnedUnits, currentSupply, vestedPerAddr, stats });
-    renderTop25({ el: root.querySelector('#top25-body'), tokenDecimals, top25: stats.top25, currentSupply });
+    renderTop25({ el: root.querySelector('#top25-body'), tokenDecimals, top25: stats.top25 });
   }
 
   function renderBubble({ root, holders, extras, tgRecipients }) {
@@ -618,15 +680,12 @@
         const isVested = d.data.__type === 'vested';
         tip.html(
           isLP
-            ? `<div><strong>${d.data.__label || 'LP'}</strong> — ${d.data.balance.toLocaleString()} tokens</div>
-               <div>${d.data.pct.toFixed(4)}% of current supply</div>
+            ? `<div><strong>${d.data.__label || 'LP'}</strong> — ${d.data.pct.toFixed(4)}% of current supply</div>
                <div style="opacity:.8;margin-top:6px">Click to open in explorer ↗</div>`
           : isVested
-            ? `<div><strong>${d.data.__label || 'VESTED'}</strong> — ${d.data.balance.toLocaleString()} tokens</div>
-               <div>${d.data.pct.toFixed(4)}% of current supply</div>
+            ? `<div><strong>${d.data.__label || 'VESTED'}</strong> — ${d.data.pct.toFixed(4)}% of current supply</div>
                <div style="opacity:.8;margin-top:6px">Click to open in explorer ↗</div>`
             : `<div><strong>${d.data.pct.toFixed(4)}% of current supply</strong></div>
-               <div>${d.data.balance.toLocaleString()} tokens</div>
                <div>${addr.slice(0,6)}...${addr.slice(-4)}</div>
                <div style="opacity:.8;margin-top:6px">Click to open in explorer ↗</div>`
         )
@@ -659,10 +718,10 @@
 
   function renderStats({ el, tokenDecimals, mintedUnits, burnedUnits, currentSupply, vestedPerAddr, stats }) {
     const vestedLines = vestedPerAddr.map((v, i) =>
-      `<div>• ${vestedPerAddr.length===1 ? 'VESTED' : `VESTED-${i+1}`} <span style="opacity:.8">(${v.address.slice(0,6)}...${v.address.slice(-4)})</span>: <strong>${(Number(v.units / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>`
+      `<div>• ${vestedPerAddr.length===1 ? 'VESTED' : `VESTED-${i+1}`} <span style="opacity:.8">(${v.address.slice(0,6)}...${v.address.slice(-4)})</span></div>`
     ).join('');
 
-    const buyersMatrix = buildBuyersMatrix(stats.firstNEnriched, { tokenDecimals, currentSupply });
+    const buyersMatrix = buildBuyersMatrix(stats.firstNEnriched);
 
     el.innerHTML = `
       <div class="section-title" style="padding-left:0">Stats</div>
@@ -678,7 +737,7 @@
       ${vestedLines || '<div style="opacity:.8">No vested addresses configured.</div>'}
 
       <div style="margin-top:10px"><strong>Holders</strong></div>
-      <div>Displayed / Total: <strong>${/* displayed holders length isn't in scope here, so omit */ ''}</strong><strong></strong> / <strong>${stats.holdersCount}</strong></div>
+      <div>Displayed / Total: <strong>${stats.displayedHolders}</strong> / <strong>${stats.holdersCount}</strong></div>
 
       <div style="margin-top:10px"><strong>Creator</strong></div>
       <div>${stats.creatorAddress ? `${stats.creatorAddress.slice(0,6)}...${stats.creatorAddress.slice(-4)}` : 'n/a'} — holds <strong>${stats.creatorPct.toFixed(4)}%</strong></div>
@@ -690,24 +749,23 @@
       ${buyersMatrix}
 
       <div style="opacity:.8;margin-top:10px">Colors — <span style="color:#00ff9c">green</span>: Hold • <span style="color:#4ea3ff">blue</span>: Sold Part • <span style="color:#ffd84e">yellow</span>: Bought More • <span style="color:#ff4e4e">red</span>: Sold All</div>
-      <div style="opacity:.6;margin-top:6px;font-size:.9em">*“First ${FIRST_BUYERS_LIMIT} buyers” = first ${FIRST_BUYERS_LIMIT} unique wallets to receive tokens from any LP (after router/aggregator hops) in on-chain order.</div>
+      <div style="opacity:.6;margin-top:6px;font-size:.9em">*“First ${FIRST_BUYERS_LIMIT} buyers” = first ${FIRST_BUYERS_LIMIT} unique wallets to receive tokens from any LP, following router/proxy hops in-tx or within ${CROSS_TX_WINDOW_SEC/60}min after each LP outflow.</div>
     `;
 
-    wireBuyersMatrixInteractions({ tokenDecimals, currentSupply });
+    wireBuyersMatrixInteractions();
   }
 
-  function renderTop25({ el, tokenDecimals, top25, currentSupply }) {
+  function renderTop25({ el, tokenDecimals, top25 }) {
     const rows = top25.map((h, i) => {
       const pct = (h.pct || 0).toFixed(4);
-      const tok = toNum(h.units, tokenDecimals).toLocaleString();
+      const link = `${EXPLORER}/address/${h.address}`;
       return `
         <div class="row" style="display:flex; align-items:center; gap:10px; padding:6px 0; border-bottom:1px solid #202020">
           <div style="width:28px; text-align:right; opacity:.85">${i+1}.</div>
           <div style="flex:1;">
-            <a href="${EXPLORER}/address/${h.address}" target="_blank" style="color:#9cc3ff; text-decoration:none">
+            <a href="${link}" target="_blank" style="color:#9cc3ff; text-decoration:none">
               ${h.address.slice(0,6)}...${h.address.slice(-4)}
             </a>
-            <div style="font-size:.9em; opacity:.85">${tok} tokens</div>
           </div>
           <div style="min-width:100px; text-align:right; font-weight:600">${pct}%</div>
         </div>
@@ -717,8 +775,8 @@
     el.innerHTML = rows || '<div style="opacity:.8">No holders found.</div>';
   }
 
-  // ===== Buyers matrix =====
-  function buildBuyersMatrix(list, { tokenDecimals, currentSupply }) {
+  // ===== Buyers matrix (percent-only hover) =====
+  function buildBuyersMatrix(list) {
     const colorFor = s =>
       s === 'hold' ? '#00ff9c' :
       s === 'soldPart' ? '#4ea3ff' :
@@ -727,28 +785,19 @@
     const cells = list.map((b, idx) => {
       const clr = colorFor(b.status);
 
-      const initTok   = toNum(b.initialUnits, tokenDecimals).toLocaleString();
-      const currTok   = toNum(b.currentUnits, tokenDecimals).toLocaleString();
-      const soldTok   = toNum(b.soldUnits,   tokenDecimals).toLocaleString();
-      const addTok    = toNum(b.boughtUnits, tokenDecimals).toLocaleString();
-
-      const initPct   = (b.initPct  || 0).toFixed(4);
-      const soldPct   = (b.soldPct  || 0).toFixed(4);
-      const addPct    = (b.boughtPct|| 0).toFixed(4);
-
-      // For progress bar (current vs initial). Clamp to 200% so "bought more" looks >100%.
-      const prog = clamp(b.progressPct || 0, 0, 200);
+      const initPct   = (b.initPct   || 0).toFixed(4);
+      const soldPct   = (b.soldPct   || 0).toFixed(4);
+      const addPct    = (b.boughtPct || 0).toFixed(4);
+      const currPct   = (b.currentPct|| 0).toFixed(4);
+      const prog      = clamp(b.progressPct || 0, 0, 200);
 
       return `
         <div class="cell"
              data-addr="${b.address}"
              data-status="${b.status}"
-             data-init-tok="${initTok}"
              data-init-pct="${initPct}"
-             data-curr-tok="${currTok}"
-             data-sold-tok="${soldTok}"
+             data-curr-pct="${currPct}"
              data-sold-pct="${soldPct}"
-             data-add-tok="${addTok}"
              data-add-pct="${addPct}"
              data-prog="${prog}"
              title="${b.address.slice(0,6)}...${b.address.slice(-4)}">
@@ -781,13 +830,13 @@
         }
         #buyers-matrix .idx { opacity:.85; }
         .tip-bar { width:180px; height:8px; background:#222; border-radius:4px; overflow:hidden; margin-top:6px; }
-        .tip-bar > span { display:block; height:100%; background:#00ff9c; } /* default green; overridden inline */
+        .tip-bar > span { display:block; height:100%; }
       </style>
       <div id="buyers-matrix">${cells}</div>
     `;
   }
 
-  function wireBuyersMatrixInteractions({ tokenDecimals, currentSupply }) {
+  function wireBuyersMatrixInteractions() {
     const container = document.getElementById('buyers-matrix');
     if (!container) return;
 
@@ -819,13 +868,14 @@
 
       const prog = Number(d.prog || 0); // 0..200
       const barWidth = Math.min(200, Math.max(0, prog)); // clamp
+
       tip.html(`
         <div><strong>${short}</strong> — ${statusToLabel(d.status)}</div>
         <div style="margin-top:6px">
-          <div>Initial buy: <strong>${d['initTok'] || d['init-tok']}</strong> (${d['initPct'] || d['init-pct']}%)</div>
-          <div>Currently: <strong>${d['currTok'] || d['curr-tok']}</strong></div>
-          <div>Sold: <strong>${d['soldTok'] || d['sold-tok']}</strong> (${d['soldPct'] || d['sold-pct']}%)</div>
-          <div>Bought more: <strong>${d['addTok'] || d['add-tok']}</strong> (${d['addPct'] || d['add-pct']}%)</div>
+          <div>Initial buy: <strong>${d['initPct'] || d['init-pct']}%</strong></div>
+          <div>Currently: <strong>${d['currPct'] || d['curr-pct']}%</strong></div>
+          <div>Sold: <strong>${d['soldPct'] || d['sold-pct']}%</strong></div>
+          <div>Bought more: <strong>${d['addPct'] || d['add-pct']}%</strong></div>
           <div class="tip-bar"><span style="width:${Math.min(100,barWidth)}%; background:${clr}"></span></div>
           <div style="opacity:.8; font-size:.9em;">Progress vs initial: ${prog.toFixed(1)}%</div>
         </div>
