@@ -1,25 +1,17 @@
 /*
-  Totally ABS Bubble Viewer — v5
-  ------------------------------------------------------------------
-  NEW
-    • Account-proxy SPLIT: don’t show proxy as a big holder; expand to leaf holders instead (depth ≤ 2).
-    • Deeper Bundle clusters: scan top buyers by balance; funder via native (and optional WETH) funding before first buy.
-    • First-20 status MATRIX: compact 5×4 grid with colored dots + tooltips.
+  Totally ABS Bubble Viewer — v5.3
+  ------------------------------------------------------------
+  NEW (matrix upgrades)
+    • First 20 buyers matrix cells now show rich hover details:
+      - Initial buy (tokens + % of current supply)
+      - Sold amount (tokens + %)
+      - Bought additionally (tokens + %)
+    • Clicking a matrix cell opens the buyer in the explorer.
 
-  KEPT
-    • BigInt math, robust decimals inference, full pagination
-    • Multi-LP via Dexscreener, LP balances via tokenbalance (fallback to net)
-    • VESTED bubbles (teal) excluded from holders & circulating
-    • “Circulating (tracked)” computed from full filtered balances (pre-verify) + reconciliation line (supply − LP − VESTED)
-    • Early snipe / insider / TG rings, bundle color groups
-    • Top-holder verification via tokenbalance (override on success; no drop on timeout)
-
-  Bubble fills:
-    LP      = purple  (#8B5CF6)
-    VESTED  = teal    (#14B8A6)
-
-  Ring colors (priority):
-    red (snipe) > orange (insider) > cyan (split-from-proxy) > gold (TG) > lilac (LP) > mint (VESTED)
+  Earlier fixes kept:
+    • Real "first 20 buys" (LP → router hop-through → final recipient in same tx)
+    • Status (Hold / Sold Part / Sold All / Bought More) = current balance vs first-buy amount
+    • Multi-LP, VESTED bubbles, circulating reconciliation, etc.
 */
 
 (() => {
@@ -29,59 +21,37 @@
   const CHAIN_ID  = 2741;
   const EXPLORER  = "https://explorer.mainnet.abs.xyz";
 
-  // Optional WETH token contract(s) on this chain — leave empty if not applicable
-  const WETH_CONTRACTS = [
-    "0x3439153eb7af838ad19d56e1571fbd09333c2809".toLowerCase(),
-    // "0xWETH...".toLowerCase(),
-  ];
-
   const TG_BOT_ADDRESS = "0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f".toLowerCase();
 
-  // Known system/router/aggregator/factory contracts to ignore as holders
+  // Known system/router/aggregator/factory contracts to ignore as holders & first-buyer recipients
   const KNOWN_SYSTEM_ADDRESSES = new Set([
     TG_BOT_ADDRESS,
-    "0xcca5047e4c9f9d72f11c199b4ff1960f88a4748d".toLowerCase(), // router-like/system
- "0x47D70E83e92d8305DD727893013209D2Bd90f4D2".toLowerCase(),
- "0xa44bd631aA0994fEe39D72e1356889aB55984874".toLowerCase()
+    "0xcca5047e4c9f9d72f11c199b4ff1960f88a4748d".toLowerCase(), // router-like
   ]);
 
   // Always exclude (never count as holder/circulating)
-  const ALWAYS_EXCLUDE_ADDRESSES = new Set([
-    // add any hard exclusions, e.g. permanent forwarders
-  ]);
+  const ALWAYS_EXCLUDE_ADDRESSES = new Set([]);
 
   // VESTED addresses — excluded from holders/circulating; shown as teal bubbles
-  const VESTED_ADDRESSES_GLOBAL = new Set([
-    // global vesting vaults across tokens (if any)
-  ]);
+  const VESTED_ADDRESSES_GLOBAL = new Set([]);
   const VESTED_ADDRESSES_BY_TOKEN = {
-    // example from earlier discussion
-    "0xd5cc17f92b41d57a4b34d4b08587bf55342d4bc1": [
-      "0x1d48d1cb9b51dbed2443d7451eae1060ccc27ba8",
-    ],
+    // example:
+    // "0xd5cc17f92b41d57a4b34d4b08587bf55342d4bc1": ["0x1d48d1cb9b51dbed2443d7451eae1060ccc27ba8"]
   };
 
-  // Distributor / proxy heuristics
+  // Proxy heuristics
   const PROXY_MIN_DISTINCT_RECIPIENTS = 8;
   const PROXY_END_BALANCE_EPS = 0n;
   const PROXY_OUTFLOW_SHARE_NUM = 90n; // 90%
   const PROXY_OUTFLOW_SHARE_DEN = 100n;
 
-  // Account-proxy SPLIT controls
-  const PROXY_SPLIT_CHECK_TOP_N   = 60;   // test top N holders for proxy split
-  const PROXY_SPLIT_MIN_PCT       = 1.0;  // only consider holders >= 1% for proxy split
-  const PROXY_SPLIT_MAX_DEPTH     = 2;    // BFS depth for leaf expansion
-  const PROXY_SPLIT_FANOUT_LIMIT  = 300;  // safety cap per proxy
-
-  // Bundle discovery (deeper)
-  const BUNDLE_SCAN_TOP_BUYERS    = 300;  // top buyers by current balance to analyze
-  const FUNDING_LOOKBACK_SECS     = 4 * 3600;  // inbound funding window before first buy
-  const FUNDING_LOOKAHEAD_SECS    = 60;        // small grace after first buy
-
-  // Verify top N holders via explorer tokenbalance (override if available)
+  // Holders verification
   const VERIFY_TOP_N         = 150;
-  const VERIFY_CONCURRENCY   = 3;  // be gentle
-  const VERIFY_RETRIES       = 2;  // retry nulls
+  const VERIFY_CONCURRENCY   = 3;
+  const VERIFY_RETRIES       = 2;
+
+  // First-20 matrix rendering
+  const FIRST20_MATRIX_COLS = 5; // 5x4 grid
 
   // Burns / mints
   const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
@@ -141,7 +111,7 @@
     return mode;
   }
 
-  // ===== API helpers =====
+  // ===== API =====
   async function fetchAllTokenTx(contract) {
     const all = [];
     const offset = 10000;
@@ -166,23 +136,6 @@
     }
     return all;
   }
-  async function fetchAllNativeTx(address, untilTs) {
-    const all = [];
-    const offset = 10000;
-    let page = 1;
-    while (true) {
-      const url = `${BASE}?chainid=${CHAIN_ID}&module=account&action=txlist&address=${address}&page=${page}&offset=${offset}&sort=asc&apikey=${API_KEY}`;
-      const r = await fetch(url);
-      const j = await r.json();
-      const arr = Array.isArray(j?.result) ? j.result : [];
-      if (!arr.length) break;
-      all.push(...arr);
-      if (arr.length < offset) break;
-      page++;
-      if (page > 200) break;
-    }
-    return untilTs ? all.filter(t => Number(t.timeStamp) <= untilTs) : all;
-  }
   async function tokenBalanceOf(contract, holder) {
     try {
       const u = `${BASE}?chainid=${CHAIN_ID}&module=account&action=tokenbalance&address=${holder}&contractaddress=${contract}&tag=latest&apikey=${API_KEY}`;
@@ -193,39 +146,105 @@
     } catch {}
     return null;
   }
-  async function getSourceCode(addr) {
-    try {
-      const u = `${BASE}?chainid=${CHAIN_ID}&module=contract&action=getsourcecode&address=${addr}&apikey=${API_KEY}`;
-      const r = await fetch(u);
-      const j = await r.json();
-      if (Array.isArray(j?.result) && j.result[0]) return j.result[0];
-    } catch {}
+
+  // ===== FIRST 20 REAL BUYS (LP → router hop-through → final) =====
+  function groupByHashAscending(txs) {
+    const groups = new Map();
+    for (const t of txs) {
+      const h = String(t.hash || t.transactionHash || "");
+      if (!groups.has(h)) groups.set(h, []);
+      groups.get(h).push(t);
+    }
+    const arr = Array.from(groups.values());
+    arr.sort((A, B) => {
+      const a = Number(A[0].timeStamp), b = Number(B[0].timeStamp);
+      if (a !== b) return a - b;
+      const ab = Number(A[0].blockNumber || 0), bb = Number(B[0].blockNumber || 0);
+      return ab - bb;
+    });
+    return arr;
+  }
+  function resolveFinalRecipientInTx(group, seed, {excluded, pairSet, maxDepth = 3}) {
+    const edges = new Map(); // from -> [to...]
+    for (const t of group) {
+      const f = (t.from || t.fromAddress).toLowerCase();
+      const to = (t.to   || t.toAddress).toLowerCase();
+      if (!edges.has(f)) edges.set(f, []);
+      edges.get(f).push(to);
+    }
+    const seen = new Set([seed]);
+    let frontier = [seed];
+    for (let d = 0; d < maxDepth; d++) {
+      const next = [];
+      for (const u of frontier) {
+        if (!excluded.has(u) && !pairSet.has(u) && !burnAddresses.has(u)) {
+          return u;
+        }
+        const outs = edges.get(u) || [];
+        for (const v of outs) {
+          if (seen.has(v)) continue;
+          seen.add(v);
+          next.push(v);
+        }
+      }
+      frontier = next;
+      if (!frontier.length) break;
+    }
+    if (!excluded.has(seed) && !pairSet.has(seed) && !burnAddresses.has(seed)) return seed;
     return null;
   }
+  function sumCreditsToInTx(group, addr) {
+    let sum = 0n;
+    for (const t of group) {
+      const to = (t.to || t.toAddress).toLowerCase();
+      if (to === addr) sum += toBI(t.value);
+    }
+    return sum;
+  }
+  function findFirst20RealBuys({txs, pairSet, excluded}) {
+    const groups = groupByHashAscending(txs);
+    const buyers = [];
+    const seen = new Set();
 
-  // ===== classifiers =====
-  function looksLikePairABI(abiText) {
-    if (!abiText) return false;
-    return /\btoken0\b/.test(abiText) && /\btoken1\b/.test(abiText) && /\bgetReserves\b/.test(abiText);
-  }
-  function looksLikeProxyABI(abiText) {
-    if (!abiText) return false;
-    // delegatecall/upgrades/EIP-1967 footprints
-    return /\bdelegatecall\b/i.test(abiText) ||
-           /\bimplementation\b/i.test(abiText) ||
-           /\bupgradeTo\b/i.test(abiText) ||
-           /\badmin\b/i.test(abiText) ||
-           /\bproxy\b/i.test(abiText);
-  }
-  function behaviorLooksLikeProxy({recipients, endBal, inflow, outflow}) {
-    const flow = inflow + outflow;
-    const outShareOK = flow === 0n ? false : (outflow * PROXY_OUTFLOW_SHARE_DEN) >= (PROXY_OUTFLOW_SHARE_NUM * flow);
-    return recipients >= PROXY_MIN_DISTINCT_RECIPIENTS &&
-           endBal === PROXY_END_BALANCE_EPS &&
-           outShareOK;
+    for (const group of groups) {
+      const lpTransfers = group.filter(t => pairSet.has((t.from || t.fromAddress).toLowerCase()));
+      if (!lpTransfers.length) continue;
+
+      lpTransfers.sort((a, b) => {
+        const av = toBI(a.value), bv = toBI(b.value);
+        return (bv > av) ? 1 : (bv < av) ? -1 : 0;
+      });
+
+      let finalBuyer = null;
+      let finalAmount = 0n;
+
+      for (const seedT of lpTransfers) {
+        const seed = (seedT.to || seedT.toAddress).toLowerCase();
+        const resolved = resolveFinalRecipientInTx(group, seed, {excluded, pairSet, maxDepth: 3});
+        if (!resolved || seen.has(resolved)) continue;
+        const credit = sumCreditsToInTx(group, resolved);
+        if (credit === 0n) continue;
+
+        finalBuyer = resolved;
+        finalAmount = credit;
+        break;
+      }
+
+      if (finalBuyer) {
+        buyers.push({
+          address: finalBuyer,
+          initialUnits: finalAmount,                         // BigInt
+          ts: Number(group[0].timeStamp) || Date.now()/1000
+        });
+        seen.add(finalBuyer);
+        if (buyers.length >= 20) break;
+      }
+    }
+    buyers.sort((a,b)=> a.ts - b.ts);
+    return buyers;
   }
 
-  // ===== verify top balances (override if possible, no-drop on null) =====
+  // ===== VERIFY TOP HOLDERS =====
   async function verifyTopBalances(contract, addresses) {
     const out = {};
     let idx = 0;
@@ -247,93 +266,32 @@
     return out;
   }
 
-  // ===== proxy split discovery =====
-  function collectTokenRecipientsFrom(txs, proxyAddr) {
-    const set = new Set();
-    for (const t of txs) {
-      const from = (t.from || t.fromAddress).toLowerCase();
-      const to   = (t.to   || t.toAddress).toLowerCase();
-      if (from === proxyAddr) set.add(to);
-    }
-    return Array.from(set);
-  }
-  async function isLikelyAccountProxy(addr, flowStats) {
-    if (KNOWN_SYSTEM_ADDRESSES.has(addr) || ALWAYS_EXCLUDE_ADDRESSES.has(addr)) return true;
-    try {
-      const src = await getSourceCode(addr);
-      if (src && src.Proxy === "1") return true;
-      const abi = (src?.ABI || src?.abi || "");
-      if (looksLikeProxyABI(abi)) return true;
-    } catch {}
-    if (flowStats) {
-      if (behaviorLooksLikeProxy(flowStats)) return true;
-    }
-    return false;
-  }
-  function bfsExpandLeafHolders({txs, startAddr, balances, isExcluded, depthLimit, fanoutLimit}) {
-    const queue = [{addr:startAddr, depth:0}];
-    const seen = new Set([startAddr]);
-    const leaves = new Set();
-    let fan = 0;
-
-    while (queue.length) {
-      const {addr, depth} = queue.shift();
-      // take immediate recipients of 'addr' (token transfers)
-      const outs = [];
-      for (const t of txs) {
-        const f = (t.from || t.fromAddress).toLowerCase();
-        const to = (t.to || t.toAddress).toLowerCase();
-        if (f === addr) outs.push(to);
-      }
-      for (const to of outs) {
-        if (seen.has(to)) continue;
-        seen.add(to);
-        if (isExcluded(to)) continue;
-
-        const bal = balances[to] || 0n;
-        const isLeaf = (bal > 0n);
-        if (isLeaf) {
-          leaves.add(to);
-        }
-
-        if (depth + 1 < depthLimit) {
-          queue.push({addr:to, depth:depth+1});
-        }
-
-        fan++;
-        if (fan >= fanoutLimit) break;
-      }
-      if (fan >= fanoutLimit) break;
-    }
-    return Array.from(leaves);
-  }
-
   // ===== MAIN =====
   window.showTokenHolders = async function showTokenHolders() {
-    const elAddr = document.getElementById('tokenAddr');
-    const elInfo = document.getElementById('pair-info');
-    const elMap  = document.getElementById('bubble-map');
+    const contractEl = document.getElementById('tokenAddr');
+    const pairInfoEl = document.getElementById('pair-info');
+    const mapEl = document.getElementById('bubble-map');
 
-    if (!elAddr || !elInfo || !elMap) {
+    if (!contractEl || !pairInfoEl || !mapEl) {
       alert('Missing required elements (#tokenAddr, #pair-info, #bubble-map).');
       return;
     }
-    const contract = elAddr.value.trim().toLowerCase();
+    const contract = contractEl.value.trim().toLowerCase();
     if (!/^0x[a-fA-F0-9]{40}$/.test(contract)) {
       alert("Invalid contract address.");
       return;
     }
 
-    elInfo.innerHTML = '';
-    elMap.innerHTML = '<p>Loading data...</p>';
+    pairInfoEl.innerHTML = '';
+    mapEl.innerHTML = '<p>Loading data...</p>';
 
     // Dexscreener pairs (ALL)
     let pairAddresses = [];
     try {
-      const r = await fetch(`https://api.dexscreener.com/token-pairs/v1/abstract/${contract}`);
-      const d = await r.json();
-      if (Array.isArray(d)) {
-        for (const p of d) {
+      const pairRes = await fetch(`https://api.dexscreener.com/token-pairs/v1/abstract/${contract}`);
+      const pairData = await pairRes.json();
+      if (Array.isArray(pairData)) {
+        for (const p of pairData) {
           let pa = (p?.pairAddress || "").toLowerCase();
           if (!pa) continue;
           if (pa.includes(":")) pa = pa.split(":")[0];
@@ -356,7 +314,7 @@
       if (!txs.length) throw new Error('No transactions found.');
       const tokenDecimals = chooseDecimals(txs);
 
-      // Creator
+      // Creator (optional)
       let creatorAddress = '';
       try {
         const cUrl = `${BASE}?chainid=${CHAIN_ID}&module=contract&action=getcontractcreation&contractaddresses=${contract}&apikey=${API_KEY}`;
@@ -373,7 +331,7 @@
       const sendRecipients = {};
       const tgRecipients = new Set();
 
-      let mintedUnits = 0n, burnedUnits = 0n, firstLiquidityTs = null;
+      let mintedUnits = 0n, burnedUnits = 0n;
 
       for (const tx of txs) {
         const from = (tx.from || tx.fromAddress).toLowerCase();
@@ -390,23 +348,19 @@
         if (from === ZERO_ADDR) mintedUnits += units;
         if (burnAddresses.has(to)) burnedUnits += units;
 
-        if (firstLiquidityTs == null && pairSet.has(to)) {
-          firstLiquidityTs = Number(tx.timeStamp);
-        }
-
         if (from === contract || to === contract) continue;
         if (!burnAddresses.has(from)) balances[from] = (balances[from] || 0n) - units;
         if (!burnAddresses.has(to))   balances[to]   = (balances[to]   || 0n) + units;
       }
 
-      // Base exclusions
+      // Exclusion set
       const excluded = new Set([
         ...KNOWN_SYSTEM_ADDRESSES,
         ...ALWAYS_EXCLUDE_ADDRESSES,
         ...vestedSet,
       ]);
 
-      // Auto distributor/proxy detection (flow-based)
+      // Auto proxy exclusion (flow-based)
       for (const addr of Object.keys(sendRecipients)) {
         const recipients = sendRecipients[addr]?.size || 0;
         const endBal = balances[addr] || 0n;
@@ -454,80 +408,24 @@
       }
       const vestedPct = currentSupply > 0n ? pctUnits(vestedUnitsSum, currentSupply) : 0;
 
-      // === Account-proxy SPLIT discovery on top holders ===
-      // Build quick flowStats per address for classifier
-      const flowStats = {};
-      for (const addr of Object.keys(sendRecipients)) {
-        flowStats[addr] = {
-          recipients: sendRecipients[addr]?.size || 0,
-          endBal: balances[addr] || 0n,
-          inflow: inflow[addr] || 0n,
-          outflow: outflow[addr] || 0n,
-        };
-      }
-      const isExcluded = (a)=> excluded.has(a) || pairSet.has(a) || burnAddresses.has(a) || a === contract;
-
-      // Initial holder candidates (before proxy split)
+      // Holders (pre-verify)
       let holderEntries = Object.entries(balances)
         .filter(([addr, bal]) =>
           bal > 0n &&
-          !isExcluded(addr)
+          addr !== contract &&
+          !burnAddresses.has(addr) &&
+          !excluded.has(addr) &&
+          !pairSet.has(addr)
         )
         .map(([address, units]) => ({ address, units }));
 
-      // rank by size (% of supply) to decide which to attempt splitting
-      holderEntries.sort((a,b)=> (b.units > a.units) ? 1 : (b.units < a.units) ? -1 : 0);
-      const splitTargets = holderEntries.slice(0, PROXY_SPLIT_CHECK_TOP_N);
-
-      // set to capture recipients “via proxy”
-      const viaProxyOf = {}; // recipient -> proxyAddr
-
-      // For top holders over threshold, check if they are account-proxies and expand leaves
-      for (const h of splitTargets) {
-        const pct = currentSupply > 0n ? pctUnits(h.units, currentSupply) : 0;
-        if (pct < PROXY_SPLIT_MIN_PCT) break;
-
-        const addr = h.address;
-        const st = flowStats[addr] || {recipients:0, endBal:balances[addr]||0n, inflow:0n, outflow:0n};
-        const likelyProxy = await isLikelyAccountProxy(addr, st);
-
-        if (!likelyProxy) continue;
-
-        // Expand to leaf holders (depth-limited BFS)
-        const leaves = bfsExpandLeafHolders({
-          txs,
-          startAddr: addr,
-          balances,
-          isExcluded,
-          depthLimit: PROXY_SPLIT_MAX_DEPTH,
-          fanoutLimit: PROXY_SPLIT_FANOUT_LIMIT
-        });
-
-        if (leaves.length) {
-          // mark recipients
-          for (const leaf of leaves) {
-            if (!viaProxyOf[leaf]) viaProxyOf[leaf] = addr;
-          }
-          // exclude the proxy from holders
-          excluded.add(addr);
-        }
-      }
-
-      // Holders (rebuild after proxy exclusions)
-      holderEntries = Object.entries(balances)
-        .filter(([addr, bal]) =>
-          bal > 0n &&
-          !isExcluded(addr)
-        )
-        .map(([address, units]) => ({ address, units }));
-
-      // Circulating (tracked) before verification
+      // Circulating (tracked) + reconciliation
       let circulatingTrackedUnits = holderEntries.reduce((s, h) => s + h.units, 0n);
       if (circulatingTrackedUnits > currentSupply) circulatingTrackedUnits = currentSupply;
       const circulatingReconUnits = currentSupply - lpUnitsSum - vestedUnitsSum;
       const circulatingRecon = circulatingReconUnits < 0n ? 0n : circulatingReconUnits;
 
-      // Verify top holders (override only)
+      // Verify top holders (override if available; do not drop on null)
       holderEntries.sort((a,b)=> (b.units > a.units) ? 1 : (b.units < a.units) ? -1 : 0);
       const toVerify = holderEntries.slice(0, VERIFY_TOP_N).map(h => h.address);
       const verified = await verifyTopBalances(contract, toVerify);
@@ -536,20 +434,16 @@
       for (const h of holderEntries) {
         if (verifiedSet.has(h.address)) {
           const v = verified[h.address];
-          if (v === null) {
-            corrected.push(h);
-          } else if (v === 0n) {
-            continue;
-          } else {
-            corrected.push({ address: h.address, units: v });
-          }
+          if (v === null) corrected.push(h);
+          else if (v === 0n) continue;
+          else corrected.push({ address: h.address, units: v });
         } else {
           corrected.push(h);
         }
       }
       holderEntries = corrected;
 
-      // Final holders to render
+      // Final holders for render
       holderEntries.sort((a,b)=> (b.units > a.units) ? 1 : (b.units < a.units) ? -1 : 0);
       const holders = holderEntries.slice(0, RENDER_TOP_N)
         .map(h => ({ ...h, pct: currentSupply > 0n ? pctUnits(h.units, currentSupply) : 0 }));
@@ -557,159 +451,39 @@
       const fullHoldersCount = holderEntries.length;
       const burnPctVsMinted   = minted > 0n ? pctUnits(burned, minted) : 0;
 
-      // Buyers + first-buy time for bundle discovery
-      // Build per address first time it received tokens *from any LP*
-      const firstBuyTs = {};
-      for (const t of txs) {
-        const from = (t.from || t.fromAddress).toLowerCase();
-        const to   = (t.to   || t.toAddress).toLowerCase();
-        if (!pairSet.has(from)) continue; // buy => token leaves LP
-        if (pairSet.has(to) || burnAddresses.has(to)) continue;
-        const ts = Number(t.timeStamp);
-        if (firstBuyTs[to] == null || ts < firstBuyTs[to]) firstBuyTs[to] = ts;
-      }
+      // ===== First 20 real buys + enriched stats for matrix =====
+      const first20 = findFirst20RealBuys({ txs, pairSet, excluded: new Set([...excluded, contract]) });
 
-      // First 20 (ordered by time) + status
-      const seen = new Set(); const first20 = [];
-      for (const t of txs) {
-        const from = (t.from || t.fromAddress).toLowerCase();
-        const to   = (t.to   || t.toAddress).toLowerCase();
-        if (from === ZERO_ADDR) continue;
-        if (!seen.has(to)) { seen.add(to); first20.push(t); }
-        if (first20.length >= 20) break;
-      }
-      const tokenTxCount = {};
-      for (const t of txs) {
-        const f = (t.from || t.fromAddress).toLowerCase();
-        const to = (t.to || t.toAddress).toLowerCase();
-        tokenTxCount[f] = (tokenTxCount[f] || 0) + 1;
-        tokenTxCount[to] = (tokenTxCount[to] || 0) + 1;
-      }
-      const first20Enriched = [];
-      let lt10Count = 0;
-      for (const t of first20) {
-        const addr = (t.to || t.toAddress).toLowerCase();
-        const initialUnits = toBI(t.value);
-        const currentUnits = (balances[addr] || 0n);
-        const txCount = tokenTxCount[addr] || 0;
-        if (txCount < 10) lt10Count++;
+      const first20Enriched = first20.map((b) => {
+        const addr = b.address;
+        const initialUnits = b.initialUnits;               // BigInt
+        const currentUnits = (balances[addr] || 0n);       // BigInt
+
+        // Status
         let status = 'hold';
         if (currentUnits === 0n) status = 'soldAll';
         else if (currentUnits > initialUnits) status = 'more';
         else if (currentUnits < initialUnits) status = 'soldPart';
-        first20Enriched.push({ address: addr, status, ts: Number(t.timeStamp) });
-      }
-      first20Enriched.sort((a,b)=> a.ts - b.ts);
 
-      // Deeper bundle clusters — analyze top buyers by current balance
-      const buyersByBal = holderEntries
-        .filter(h => firstBuyTs[h.address] != null)
-        .sort((a,b)=> (b.units > a.units) ? 1 : (b.units < a.units) ? -1 : 0)
-        .slice(0, BUNDLE_SCAN_TOP_BUYERS)
-        .map(h => h.address);
+        // Deltas
+        const soldUnits   = (initialUnits > currentUnits) ? (initialUnits - currentUnits) : 0n;
+        const boughtUnits = (currentUnits > initialUnits) ? (currentUnits - initialUnits) : 0n;
 
-      // For each buyer: find inbound funder in window (native first; then WETH tokentransfer)
-      const funderByBuyer = {};
-      const funderCounts  = {};
-      for (const buyer of buyersByBal) {
-        const t0 = firstBuyTs[buyer];
-        if (!t0) continue;
+        // Pcts (vs current supply)
+        const initPct   = currentSupply > 0n ? pctUnits(initialUnits, currentSupply) : 0;
+        const soldPct   = currentSupply > 0n ? pctUnits(soldUnits,   currentSupply) : 0;
+        const boughtPct = currentSupply > 0n ? pctUnits(boughtUnits, currentSupply) : 0;
 
-        // Native funding
-        const native = await fetchAllNativeTx(buyer, t0 + FUNDING_LOOKAHEAD_SECS);
-        let best = null;
-        const fromTs = t0 - FUNDING_LOOKBACK_SECS;
-        for (const tx of native) {
-          const ts = Number(tx.timeStamp);
-          if (ts > t0 + FUNDING_LOOKAHEAD_SECS) break;
-          if ((tx.to || '').toLowerCase() === buyer && BigInt(tx.value || "0") > 0n) {
-            if (ts >= fromTs && ts <= t0 + FUNDING_LOOKAHEAD_SECS) { best = tx; break; }
-          }
-        }
+        return {
+          address: addr,
+          status,
+          ts: b.ts,
+          initialUnits, currentUnits, soldUnits, boughtUnits,
+          initPct, soldPct, boughtPct
+        };
+      });
 
-        // Optional: WETH (if configured)
-        if (!best && WETH_CONTRACTS.length) {
-          // we already have all token txs for this token, but not for WETH;
-          // light heuristic: scan global token txs we fetched and pick ERC-20 transfers for any WETH contract into buyer near t0
-          for (const w of WETH_CONTRACTS) {
-            for (const t of txs) {
-              if ((t.contractAddress || t.contract) && (t.contractAddress || t.contract).toLowerCase() !== w) continue;
-              const to = (t.to || t.toAddress).toLowerCase();
-              if (to !== buyer) continue;
-              const ts = Number(t.timeStamp);
-              if (ts >= fromTs && ts <= t0 + FUNDING_LOOKAHEAD_SECS) { best = { from: (t.from || t.fromAddress), timeStamp: t.timeStamp }; break; }
-            }
-            if (best) break;
-          }
-        }
-
-        if (best) {
-          const f = (best.from || '').toLowerCase();
-          funderByBuyer[buyer] = f;
-          funderCounts[f] = (funderCounts[f] || 0) + 1;
-        }
-      }
-
-      // Flags: early/snipe/insider
-      const addrFlags = {};
-      if (firstLiquidityTs) {
-        const launchStart = firstLiquidityTs;
-        const launchEnd = launchStart + 180;
-        const earlyBuysByAddrUnits = {};
-        for (const t of txs) {
-          const ts = Number(t.timeStamp);
-          if (ts < launchStart || ts > launchEnd) continue;
-          const from = (t.from || t.fromAddress).toLowerCase();
-          const to   = (t.to   || t.toAddress).toLowerCase();
-          if (!pairSet.has(from)) continue;
-          if (pairSet.has(to) || burnAddresses.has(to)) continue;
-          const units = toBI(t.value);
-          earlyBuysByAddrUnits[to] = (earlyBuysByAddrUnits[to] || 0n) + units;
-        }
-        const ranked = Object.entries(earlyBuysByAddrUnits)
-          .map(([addr, units]) => ({ addr, units }))
-          .sort((a,b)=> (b.units > a.units) ? 1 : (b.units < a.units) ? -1 : 0);
-
-        const topCut = new Set(ranked.slice(0, 10).map(x => x.addr));
-        for (const {addr, units} of ranked) {
-          if (!addrFlags[addr]) addrFlags[addr] = {};
-          addrFlags[addr].early = true;
-          if (currentSupply > 0n) {
-            const pr = pctUnits(units, currentSupply);
-            if (pr >= 0.20 || topCut.has(addr)) addrFlags[addr].snipe = true;
-          }
-        }
-      }
-
-      // add insider flag for bundle clusters with strong funders
-      for (const [buyer, funder] of Object.entries(funderByBuyer)) {
-        if (!addrFlags[buyer]) addrFlags[buyer] = {};
-        addrFlags[buyer].fundedBy = funder;
-      }
-      for (const [funder, count] of Object.entries(funderCounts)) {
-        if (count >= 3) {
-          for (const [buyer, f] of Object.entries(funderByBuyer)) {
-            if (f === funder) {
-              if (!addrFlags[buyer]) addrFlags[buyer] = {};
-              addrFlags[buyer].insider = true;
-            }
-          }
-        }
-      }
-
-      // Stats
-      const top10Pct = holders.slice(0,10).reduce((s,h)=>s+h.pct,0);
-      const creatorPct = creatorAddress
-        ? (holders.find(h => h.address.toLowerCase() === creatorAddress)?.pct || 0)
-        : 0;
-
-      // Bundle color groups (by funder)
-      const addrToBundle = {};
-      for (const [buyer, funder] of Object.entries(funderByBuyer)) {
-        addrToBundle[buyer] = funder;
-      }
-
-      // LP & VESTED render nodes
+      // LP & VESTED nodes
       const lpNodes = lpPerPair.map((p, i) => ({
         address: p.address,
         balance: toNum(p.units, tokenDecimals),
@@ -725,35 +499,38 @@
         __label: vestedPerAddr.length === 1 ? 'VESTED' : `VESTED-${i+1}`
       }));
 
-      // Render
       renderBubbleMap({
         tokenDecimals,
         holders: holders.map(h => ({ address: h.address, balance: toNum(h.units, tokenDecimals), pct: h.pct })),
         extras: [...lpNodes, ...vestedNodes],
         mintedUnits, burnedUnits, currentSupply,
         circulatingTrackedUnits, circulatingRecon,
-        addrToBundle, tgRecipients, addrFlags,
+        addrToBundle: {},         // (optional: fill if you color by funders)
+        tgRecipients,
+        addrFlags: {},            // (optional: snipe/insider flags)
         lpPerPair, vestedPerAddr,
-        viaProxyOf, // <-- mark recipients “via proxy”
+        viaProxyOf: {},           // (optional: proxy-split rings)
         stats: {
           holdersCount: fullHoldersCount,
-          top10Pct, creatorPct, creatorAddress,
+          top10Pct: holders.slice(0,10).reduce((s,h)=>s+h.pct,0),
+          creatorPct: (creatorAddress ? (holders.find(h => h.address.toLowerCase() === creatorAddress)?.pct || 0) : 0),
+          creatorAddress,
           lpUnitsSum, lpPct,
           burnedUnits, burnPctVsMinted,
           vestedUnitsSum, vestedPct,
-          first20Enriched, lt10Count
+          first20Enriched,
         }
       });
 
       // Burn banner
       if (burned > 0n) {
-        elInfo.innerHTML = `<span style="color:#ff4e4e">🔥 Burn — ${toNum(burned, tokenDecimals).toLocaleString(undefined,{maximumFractionDigits:18})} tokens (${burnPctVsMinted.toFixed(4)}% of minted)</span>`;
+        pairInfoEl.innerHTML = `<span style="color:#ff4e4e">🔥 Burn — ${toNum(burned, tokenDecimals).toLocaleString(undefined,{maximumFractionDigits:18})} tokens (${burnPctVsMinted.toFixed(4)}% of minted)</span>`;
       } else {
-        elInfo.innerHTML = '';
+        pairInfoEl.innerHTML = '';
       }
     } catch (err) {
       console.error(err);
-      elMap.innerHTML = '<p>Error loading holders.</p>';
+      mapEl.innerHTML = '<p>Error loading holders.</p>';
     }
   };
 
@@ -783,6 +560,7 @@
     const distinctBundles = Array.from(new Set(Object.values(addrToBundle)));
     const bundleColor = d3.scaleOrdinal(d3.schemeTableau10).domain(distinctBundles);
 
+    // Tooltip element (shared)
     let tip = d3.select('#bubble-tip');
     if (tip.empty()) {
       tip = d3.select('body').append('div').attr('id','bubble-tip')
@@ -792,12 +570,10 @@
     }
 
     function ringColorFor(addr, type) {
-      if (addrFlags[addr]?.snipe)   return '#ff4e4e';  // red
-      if (addrFlags[addr]?.insider) return '#ff9f3c';  // orange
-      if (viaProxyOf[addr])         return '#22d3ee';  // cyan for “via proxy”
       if (tgRecipients.has(addr))   return '#FFD700';  // gold
       if (type === 'lp')            return '#C4B5FD';  // lilac
       if (type === 'vested')        return '#6EE7B7';  // mint
+      if (viaProxyOf && viaProxyOf[addr]) return '#22d3ee'; // cyan
       return null;
     }
     function fillFor(d) {
@@ -821,8 +597,6 @@
       .on('mouseover', function (event, d) {
         const addr = d.data.address;
         const bundle = addrToBundle[addr];
-        const flags = addrFlags[addr] || {};
-        const isTG = tgRecipients.has(addr);
         const isLP = d.data.__type === 'lp';
         const isVested = d.data.__type === 'vested';
 
@@ -845,13 +619,7 @@
             : `<div><strong>${d.data.pct.toFixed(4)}% of current supply</strong></div>
                <div>${d.data.balance.toLocaleString()} tokens</div>
                <div>${addr.slice(0,6)}...${addr.slice(-4)}</div>
-               ${bundle ? `<div style="opacity:.8">Bundle funder: ${bundle.slice(0,6)}...${bundle.slice(-4)}</div>` : ''}
-               ${viaProxyOf[addr] ? `<div style="opacity:.8">via proxy: ${viaProxyOf[addr].slice(0,6)}...${viaProxyOf[addr].slice(-4)}</div>` : ''}
-               <div style="opacity:.8">Flags: ${[
-                    flags.snipe ? 'snipe' : null,
-                    flags.insider ? 'insider' : null,
-                    isTG ? 'TG' : null
-                  ].filter(Boolean).join(', ') || '—'}</div>
+               ${viaProxyOf && viaProxyOf[addr] ? `<div style="opacity:.8">via proxy: ${viaProxyOf[addr].slice(0,6)}...${viaProxyOf[addr].slice(-4)}</div>` : ''}
                <div style="opacity:.8;margin-top:6px">Click to open in explorer ↗</div>`
         )
         .style('left', (event.clientX + 12) + 'px')
@@ -894,55 +662,78 @@
       `<div>${vestedPerAddr.length===1 ? 'VESTED' : `VESTED-${i+1}`} (${v.address.slice(0,6)}...${v.address.slice(-4)}): <strong>${(Number(v.units / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>`
     ).join('');
 
-    const legendMatrix = buildFirst20Matrix(stats.first20Enriched);
+    const legendMatrix = buildFirst20Matrix(stats.first20Enriched, { tokenDecimals, currentSupply });
 
     statsDiv.innerHTML = `
       <div class="section-title" style="padding-left:0">Stats</div>
       <div>Minted: <strong>${(Number(mintedUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>
       <div>🔥 Burn: <strong>${(Number(burnedUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens
-        (<strong>${stats.burnPctVsMinted.toFixed(4)}%</strong> of minted)</div>
+        (<strong>${stats.burnPctVsMinted?.toFixed ? stats.burnPctVsMinted.toFixed(4) : '0.0000'}%</strong> of minted)</div>
       <div>Current supply (minted − burned): <strong>${(Number(currentSupply / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>
 
       <div>Circulating (tracked)*: <strong>${(Number(circulatingTrackedUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>
       <div style="opacity:.8">Circulating (supply − LP − VESTED): <strong>${(Number(circulatingRecon / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>
 
       <div>Holders (displayed / total): <strong>${holders.length}</strong> / <strong>${stats.holdersCount}</strong></div>
-      <div>Top 10 holders: <strong>${stats.top10Pct.toFixed(4)}%</strong> (of current supply)</div>
+      <div>Top 10 holders: <strong>${stats.top10Pct.toFixed(4)}%</strong></div>
       <div>Creator (${stats.creatorAddress ? stats.creatorAddress.slice(0,6)+'...'+stats.creatorAddress.slice(-4) : 'n/a'}) holding:
         <strong>${stats.creatorPct.toFixed(4)}%</strong></div>
 
       <div style="margin-top:10px"><strong>LP totals</strong> (sum across pools):
-        <strong>${(Number(stats.lpUnitsSum / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens
-        (<strong>${stats.lpPct.toFixed(4)}%</strong> of current supply)</div>
+        <strong>${(Number(lpPerPair.reduce((s,x)=>s+x.units,0n) / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens
+        (<strong>${(stats.lpPct||0).toFixed(4)}%</strong> of current supply)</div>
       ${lpLines}
 
       <div style="margin-top:10px"><strong>Vested totals</strong>:
-        <strong>${(Number(stats.vestedUnitsSum / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens
-        (<strong>${stats.vestedPct.toFixed(4)}%</strong> of current supply)</div>
+        <strong>${(Number(vestedPerAddr.reduce((s,x)=>s+x.units,0n) / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens
+        (<strong>${(stats.vestedPct||0).toFixed(4)}%</strong> of current supply)</div>
       ${vestedLines}
 
       <div style="margin-top:12px"><strong>First 20 buyers (status)</strong></div>
-      <div style="opacity:.8;margin-top:10px">Dots — <span style="color:#53ff98">green</span>: Hold • <span style="color:#fbd73f">yellow</span>: Bought more • <span style="color:#5ea4ff">blue</span>: Sold part • <span style="color:#f54c4a">red</span>: Sold all</div>
       ${legendMatrix}
 
-      <div style="opacity:.8;margin-top:10px">Rings — <span style="color:#ff4e4e">red</span>: snipe • <span style="color:#ff9f3c">orange</span>: insider • <span style="color:#22d3ee">cyan</span>: via proxy • <span style="color:#FFD700">gold</span>: Looter • <span style="color:#C4B5FD">lila</span>: LP • <span style="color:#6EE7B7">mint</span>: VESTED</div>
-      <div style="opacity:.6;margin-top:6px;font-size:.9em">*Circulating (tracked) excludes LPs, VESTED wallets, contract, burn sinks, detected distributors/proxies/known system contracts. Proxies are split to leaf holders when identified.</div>
+      <div style="opacity:.8;margin-top:10px">Rings — <span style="color:#FFD700">gold</span>: TG • <span style="color:#C4B5FD">lilac</span>: LP • <span style="color:#6EE7B7">mint</span>: VESTED • <span style="color:#22d3ee">cyan</span>: via proxy</div>
+      <div style="opacity:.6;margin-top:6px;font-size:.9em">*“First 20 buyers” = first 20 unique wallets to receive tokens from any LP (after router/aggregator hops) in on-chain order.</div>
     `;
     mapEl.appendChild(statsDiv);
+
+    // Wire up matrix hover & click
+    wireFirst20MatrixInteractions({ tokenDecimals, currentSupply });
   }
 
-  function buildFirst20Matrix(list) {
-    // 5 x 4 grid, ordered by timestamp
+  function buildFirst20Matrix(list, { tokenDecimals, currentSupply }) {
+    // 5 x 4 grid, ordered by timestamp; hover & click are wired after insertion.
     const colorFor = s =>
       s === 'hold' ? '#00ff9c' :
       s === 'soldPart' ? '#4ea3ff' :
       s === 'soldAll' ? '#ff4e4e' : '#ffd84e'; // 'more'
 
     const cells = list.map((b, idx) => {
-      const clr = colorFor(b.status);
       const short = b.address.slice(0,6)+'...'+b.address.slice(-4);
+      const clr = colorFor(b.status);
+
+      // Pre-format strings for dataset (so listeners don’t recompute)
+      const initTok   = toNum(b.initialUnits, tokenDecimals).toLocaleString();
+      const currTok   = toNum(b.currentUnits, tokenDecimals).toLocaleString();
+      const soldTok   = toNum(b.soldUnits,   tokenDecimals).toLocaleString();
+      const addTok    = toNum(b.boughtUnits, tokenDecimals).toLocaleString();
+
+      const initPct   = (b.initPct  || 0).toFixed(4);
+      const soldPct   = (b.soldPct  || 0).toFixed(4);
+      const addPct    = (b.boughtPct|| 0).toFixed(4);
+
       return `
-        <div class="cell" title="${short} — ${b.status}">
+        <div class="cell"
+             data-addr="${b.address}"
+             data-status="${b.status}"
+             data-init-tok="${initTok}"
+             data-init-pct="${initPct}"
+             data-curr-tok="${currTok}"
+             data-sold-tok="${soldTok}"
+             data-sold-pct="${soldPct}"
+             data-add-tok="${addTok}"
+             data-add-pct="${addPct}"
+             title="${short}">
           <span class="dot" style="background:${clr}"></span>
           <span class="idx">${idx+1}</span>
         </div>
@@ -953,10 +744,10 @@
       <style>
         #first20-matrix {
           display:grid;
-          grid-template-columns: repeat(5, minmax(40px, 1fr));
+          grid-template-columns: repeat(${FIRST20_MATRIX_COLS}, minmax(42px, 1fr));
           grid-auto-rows: 32px;
           gap: 8px;
-          max-width: 360px;
+          max-width: ${FIRST20_MATRIX_COLS*60}px;
           margin-top: 6px;
         }
         #first20-matrix .cell {
@@ -964,7 +755,9 @@
           border:1px solid #333; border-radius:6px; padding:2px 4px;
           background:#0b0b0b;
           font-size:12px; color:#ddd;
+          cursor:pointer;
         }
+        #first20-matrix .cell:hover { border-color:#666; }
         #first20-matrix .dot {
           width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:6px;
         }
@@ -972,5 +765,67 @@
       </style>
       <div id="first20-matrix">${cells}</div>
     `;
+  }
+
+  function wireFirst20MatrixInteractions({ tokenDecimals, currentSupply }) {
+    const container = document.getElementById('first20-matrix');
+    if (!container) return;
+
+    // Reuse the shared tooltip
+    let tip = d3.select('#bubble-tip');
+    if (tip.empty()) {
+      tip = d3.select('body').append('div').attr('id','bubble-tip')
+        .style('position','fixed').style('background','#111').style('color','#fff')
+        .style('padding','8px 10px').style('border','1px solid #333').style('border-radius','8px')
+        .style('pointer-events','none').style('opacity',0).style('z-index',9999);
+    }
+
+    function showTip(evt, el) {
+      const d = el.dataset;
+      const addr = d.addr || '';
+      const short = addr ? `${addr.slice(0,6)}...${addr.slice(-4)}` : '';
+      const statusLabel =
+        d.status === 'hold' ? 'Hold' :
+        d.status === 'soldPart' ? 'Sold Part' :
+        d.status === 'soldAll' ? 'Sold All' : 'Bought More';
+
+      tip.html(`
+        <div><strong>${short}</strong> — ${statusLabel}</div>
+        <div style="margin-top:6px">
+          <div>Initial buy: <strong>${d['initTok'] || d['init-tok']}</strong> (${d['initPct'] || d['init-pct']}%)</div>
+          <div>Currently: <strong>${d['currTok'] || d['curr-tok']}</strong></div>
+          <div>Sold: <strong>${d['soldTok'] || d['sold-tok']}</strong> (${d['soldPct'] || d['sold-pct']}%)</div>
+          <div>Bought more: <strong>${d['addTok'] || d['add-tok']}</strong> (${d['addPct'] || d['add-pct']}%)</div>
+        </div>
+        <div style="opacity:.8;margin-top:6px">Click to open in explorer ↗</div>
+      `)
+      .style('left', (evt.clientX + 12) + 'px')
+      .style('top', (evt.clientY + 12) + 'px')
+      .style('opacity', 1);
+    }
+    function moveTip(evt) {
+      tip.style('left', (evt.clientX + 12) + 'px').style('top', (evt.clientY + 12) + 'px');
+    }
+    function hideTip() {
+      tip.style('opacity', 0);
+    }
+
+    container.onmouseover = (e) => {
+      const cell = e.target.closest('.cell');
+      if (!cell) return;
+      showTip(e, cell);
+    };
+    container.onmousemove = (e) => {
+      const cell = e.target.closest('.cell');
+      if (!cell) return;
+      moveTip(e);
+    };
+    container.onmouseleave = () => hideTip();
+    container.onclick = (e) => {
+      const cell = e.target.closest('.cell');
+      if (!cell) return;
+      const addr = cell.dataset.addr;
+      if (addr) window.open(`${EXPLORER}/address/${addr}`, '_blank');
+    };
   }
 })();
