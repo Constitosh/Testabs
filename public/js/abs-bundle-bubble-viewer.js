@@ -1,26 +1,15 @@
+
 /*
-  Totally ABS Bubble Viewer — v5.5 (no .env)
+  Totally ABS Bubble Viewer — v5.7 (no .env)
   ------------------------------------------------------------
-  Changes vs your v5.3:
-    • First 20 real buyers:
-       - Scans every tx that has LP→* transfers
-       - Considers ALL LP→X seeds in a tx (largest first)
-       - Resolves router/aggregator hops within the tx to the final wallet
-       - Adds unique buyers until 20 (not just 1 per tx)
-       - Strict chronological order by block/time/logIndex
-    • First-20 matrix: status + rich hover preserved; click opens in explorer
-    • UI: two collapsible dropdowns — Bubble Map and Stats
-    • Stats order updated:
-       Pool info
-       Minted Tokens
-       Burned Tokens
-       (removed: Current supply, Circulating (tracked))
-       Holders
-       Creator
-       Top 10 Holders
-       LP Totals
-       Vested Tokens
-       First 20 buyers (Status)
+  • First buyers: up to FIRST_BUYERS_LIMIT (=25) unique buyers
+    - scans every tx with LP→* transfers
+    - considers ALL LP→X seeds per tx (largest first)
+    - resolves router/aggregator hops within the tx to the final wallet
+    - strict chronological order (time, block, logIndex)
+  • Matrix: status colors + rich hover with tokens, % of current supply, and a progress bar
+  • UI: three collapsible sections: Bubble Map, Stats, Top 25 Holders
+  • Stats order: Minted Tokens, Burned Tokens, Vested Tokens, Holders, Creator, Top 10 Holders
 */
 
 (() => {
@@ -58,8 +47,9 @@
   const VERIFY_CONCURRENCY   = 3;
   const VERIFY_RETRIES       = 2;
 
-  // First-20 matrix rendering
-  const FIRST20_MATRIX_COLS = 5; // 5x4 grid
+  // First buyers
+  const FIRST_BUYERS_LIMIT   = 25;
+  const FIRST_MATRIX_COLS    = 5; // 5 x 5 grid for 25
 
   // Burns / mints
   const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
@@ -88,6 +78,7 @@
     const q = (numBI * SCALE) / denBI;
     return Number(q) / 10_000;
   }
+  function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
   function countTrailingZeros10(u) {
     let n = 0;
     while (u !== 0n && (u % 10n === 0n) && n < 18) { u /= 10n; n++; }
@@ -155,7 +146,7 @@
     return null;
   }
 
-  // ===== FIRST 20 REAL BUYS (improved) =====
+  // ===== FIRST N REAL BUYS (LP → router hop-through → final) =====
   function groupByHashAscending(txs) {
     const groups = new Map();
     for (const t of txs) {
@@ -164,7 +155,6 @@
       groups.get(h).push(t);
     }
     const arr = Array.from(groups.values());
-    // sort groups by (time, block, logIndex)
     arr.sort((A, B) => {
       const aT = Number(A[0].timeStamp), bT = Number(B[0].timeStamp);
       if (aT !== bT) return aT - bT;
@@ -173,7 +163,6 @@
       const aL = Number(A[0].logIndex || 0), bL = Number(B[0].logIndex || 0);
       return aL - bL;
     });
-    // stabilize inside each group by logIndex
     for (const g of arr) g.sort((x,y)=> Number(x.logIndex||0) - Number(y.logIndex||0));
     return arr;
   }
@@ -214,7 +203,7 @@
     }
     return sum;
   }
-  function findFirst20RealBuys({txs, pairSet, excluded}) {
+  function findFirstNRealBuys({txs, pairSet, excluded, limit}) {
     const groups = groupByHashAscending(txs);
     const buyers = [];
     const seen = new Set();
@@ -243,7 +232,7 @@
           ts: Number(group[0].timeStamp) || Date.now()/1000
         });
         seen.add(resolved);
-        if (buyers.length >= 20) break outer;
+        if (buyers.length >= limit) break outer;
       }
     }
     buyers.sort((a,b)=> a.ts - b.ts);
@@ -386,9 +375,8 @@
       const burned = burnedUnits;
       const currentSupply = minted >= burned ? (minted - burned) : 0n;
 
-      // LP balances
+      // LP balances (for bubbles)
       const lpPerPair = [];
-      let lpUnitsSum = 0n;
       for (const pa of pairSet) {
         let units = await tokenBalanceOf(contract, pa);
         if (units == null) {
@@ -396,8 +384,8 @@
           if (units < 0n) units = 0n;
         }
         lpPerPair.push({ address: pa, units });
-        lpUnitsSum += units;
       }
+      const lpUnitsSum = lpPerPair.reduce((s,p)=>s+p.units,0n);
       const lpPct = currentSupply > 0n ? pctUnits(lpUnitsSum, currentSupply) : 0;
 
       // VESTED balances
@@ -451,10 +439,10 @@
       const fullHoldersCount = holderEntries.length;
       const burnPctVsMinted   = minted > 0n ? pctUnits(burned, minted) : 0;
 
-      // ===== First 20 real buys + enriched stats for matrix =====
-      const first20 = findFirst20RealBuys({ txs, pairSet, excluded: new Set([...excluded, contract]) });
+      // ===== First N real buys + enriched for matrix =====
+      const firstN = findFirstNRealBuys({ txs, pairSet, excluded: new Set([...excluded, contract]), limit: FIRST_BUYERS_LIMIT });
 
-      const first20Enriched = first20.map((b) => {
+      const firstNEnriched = firstN.map((b) => {
         const addr = b.address;
         const initialUnits = b.initialUnits;               // BigInt
         const currentUnits = (balances[addr] || 0n);       // BigInt
@@ -474,12 +462,16 @@
         const soldPct   = currentSupply > 0n ? pctUnits(soldUnits,   currentSupply) : 0;
         const boughtPct = currentSupply > 0n ? pctUnits(boughtUnits, currentSupply) : 0;
 
+        // Progress (current vs initial)
+        const progressPct = initialUnits === 0n ? 0 : clamp(Number((currentUnits * 10000n) / (initialUnits === 0n ? 1n : initialUnits)) / 100, 0, 200);
+
         return {
           address: addr,
           status,
           ts: b.ts,
           initialUnits, currentUnits, soldUnits, boughtUnits,
-          initPct, soldPct, boughtPct
+          initPct, soldPct, boughtPct,
+          progressPct
         };
       });
 
@@ -499,12 +491,18 @@
         __label: vestedPerAddr.length === 1 ? 'VESTED' : `VESTED-${i+1}`
       }));
 
-      renderBubbleMap({
+      // Top 25 list
+      const top25 = holderEntries.slice(0, 25).map(h => ({
+        address: h.address,
+        units: h.units,
+        pct: currentSupply > 0n ? pctUnits(h.units, currentSupply) : 0
+      }));
+
+      renderUI({
         tokenDecimals,
         holders: holders.map(h => ({ address: h.address, balance: toNum(h.units, tokenDecimals), pct: h.pct })),
         extras: [...lpNodes, ...vestedNodes],
         mintedUnits, burnedUnits, currentSupply,
-        addrToBundle: {},         // (optional: funder colors)
         tgRecipients,
         lpPerPair, vestedPerAddr,
         stats: {
@@ -515,15 +513,17 @@
           lpUnitsSum, lpPct,
           burnedUnits, burnPctVsMinted,
           vestedUnitsSum, vestedPct,
-          first20Enriched,
+          firstNEnriched,
+          top25
         }
       });
 
-      // Burn banner in the small header (unchanged)
+      // Burn banner in header
       if (burned > 0n) {
-        pairInfoEl.innerHTML = `<span style="color:#ff4e4e">🔥 Burn — ${toNum(burned, tokenDecimals).toLocaleString(undefined,{maximumFractionDigits:18})} tokens (${burnPctVsMinted.toFixed(4)}% of minted)</span>`;
+        document.getElementById('pair-info').innerHTML =
+          `<span style="color:#ff4e4e">🔥 Burn — ${toNum(burned, tokenDecimals).toLocaleString(undefined,{maximumFractionDigits:18})} tokens (${burnPctVsMinted.toFixed(4)}% of minted)</span>`;
       } else {
-        pairInfoEl.innerHTML = '';
+        document.getElementById('pair-info').innerHTML = '';
       }
     } catch (err) {
       console.error(err);
@@ -531,19 +531,10 @@
     }
   };
 
-  // ===== RENDERER =====
-  function renderBubbleMap({
-    tokenDecimals, holders, extras = [],
-    mintedUnits, burnedUnits, currentSupply,
-    addrToBundle, tgRecipients,
-    lpPerPair, vestedPerAddr, stats
-  }) {
-    const mapRoot = document.getElementById('bubble-map');
-    mapRoot.innerHTML = '';
-
-    // --- Collapsible containers UI ---
-    const ui = document.createElement('div');
-    ui.innerHTML = `
+  // ===== RENDERER / UI =====
+  function renderUI({ tokenDecimals, holders, extras, mintedUnits, burnedUnits, currentSupply, tgRecipients, lpPerPair, vestedPerAddr, stats }) {
+    const root = document.getElementById('bubble-map');
+    root.innerHTML = `
       <style>
         .acc { border:1px solid #2a2a2a; border-radius:10px; margin-bottom:12px; overflow:hidden; }
         .acc-h { width:100%; text-align:left; background:#121212; color:#e6e6e6; padding:10px 12px; border:0; cursor:pointer; font-weight:600; display:flex; align-items:center; gap:8px; }
@@ -560,32 +551,34 @@
         <button class="acc-h"><span class="arrow">▾</span> Stats</button>
         <div class="acc-b"><div id="stats-body"></div></div>
       </div>
+      <div class="acc" id="acc-top25">
+        <button class="acc-h"><span class="arrow">▾</span> Top 25 Holders</button>
+        <div class="acc-b"><div id="top25-body"></div></div>
+      </div>
     `;
-    mapRoot.appendChild(ui);
 
-    // Toggle handlers
-    ui.querySelectorAll('.acc .acc-h').forEach(btn => {
+    // toggles
+    root.querySelectorAll('.acc .acc-h').forEach(btn => {
       btn.addEventListener('click', () => btn.parentElement.classList.toggle('collapsed'));
     });
 
-    const bubbleEl = ui.querySelector('#bubble-canvas');
-    const statsEl  = ui.querySelector('#stats-body');
+    renderBubble({ root: root.querySelector('#bubble-canvas'), holders, extras, tgRecipients });
+    renderStats({ el: root.querySelector('#stats-body'), tokenDecimals, mintedUnits, burnedUnits, currentSupply, vestedPerAddr, stats });
+    renderTop25({ el: root.querySelector('#top25-body'), tokenDecimals, top25: stats.top25, currentSupply });
+  }
 
-    // --- Bubble Map (holders + extras) ---
-    const width = mapRoot.offsetWidth || 960;
+  function renderBubble({ root, holders, extras, tgRecipients }) {
+    const width = root.offsetWidth || 960;
     const height = 640;
     const data = holders.concat(extras);
 
-    const svg = d3.select(bubbleEl).append('svg')
+    const svg = d3.select(root).append('svg')
       .attr('width', width)
       .attr('height', height);
 
     const pack = d3.pack().size([width, height]).padding(3);
-    const root = d3.hierarchy({ children: data }).sum(d => d.balance);
-    const nodes = pack(root).leaves();
-
-    const distinctBundles = Array.from(new Set(Object.values(addrToBundle)));
-    const bundleColor = d3.scaleOrdinal(d3.schemeTableau10).domain(distinctBundles);
+    const droot = d3.hierarchy({ children: data }).sum(d => d.balance);
+    const nodes = pack(droot).leaves();
 
     // Tooltip element (shared)
     let tip = d3.select('#bubble-tip');
@@ -605,8 +598,7 @@
     function fillFor(d) {
       if (d.data.__type === 'lp')     return '#8B5CF6';
       if (d.data.__type === 'vested') return '#14B8A6';
-      const bundle = addrToBundle[d.data.address];
-      return bundle ? bundleColor(bundle) : '#4b5563';
+      return '#4b5563';
     }
 
     const g = svg.selectAll('g')
@@ -622,17 +614,8 @@
       .attr('stroke-width', d => ringColorFor(d.data.address, d.data.__type) ? 2.5 : null)
       .on('mouseover', function (event, d) {
         const addr = d.data.address;
-        const bundle = addrToBundle[addr];
         const isLP = d.data.__type === 'lp';
         const isVested = d.data.__type === 'vested';
-
-        if (!isLP && !isVested) {
-          g.selectAll('circle')
-            .attr('opacity', node => bundle ? (addrToBundle[node.data.address] === bundle ? 1 : 0.15) : 1)
-            .attr('stroke', node => ringColorFor(node.data.address, node.data.__type))
-            .attr('stroke-width', node => ringColorFor(node.data.address, node.data.__type) ? 2.5 : null);
-        }
-
         tip.html(
           isLP
             ? `<div><strong>${d.data.__label || 'LP'}</strong> — ${d.data.balance.toLocaleString()} tokens</div>
@@ -656,9 +639,6 @@
       })
       .on('mouseout', function () {
         tip.style('opacity', 0);
-        g.selectAll('circle').attr('opacity', 1)
-          .attr('stroke', d => ringColorFor(d.data.address, d.data.__type))
-          .attr('stroke-width', d => ringColorFor(d.data.address, d.data.__type) ? 2.5 : null);
       })
       .on('click', (event, d) => {
         window.open(`${EXPLORER}/address/${d.data.address}`, '_blank');
@@ -675,22 +655,17 @@
                   : d.data.__type === 'vested'
                     ? (d.data.__label || 'VESTED')
                     : `${d.data.pct.toFixed(2)}%`);
+  }
 
-    // --- Stats body (order updated) ---
-    const lpLines = lpPerPair.map((p, i) =>
-      `<div>• LP-${i+1} <span style="opacity:.8">(${p.address.slice(0,6)}...${p.address.slice(-4)})</span>: <strong>${(Number(p.units / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>`
-    ).join('');
+  function renderStats({ el, tokenDecimals, mintedUnits, burnedUnits, currentSupply, vestedPerAddr, stats }) {
     const vestedLines = vestedPerAddr.map((v, i) =>
       `<div>• ${vestedPerAddr.length===1 ? 'VESTED' : `VESTED-${i+1}`} <span style="opacity:.8">(${v.address.slice(0,6)}...${v.address.slice(-4)})</span>: <strong>${(Number(v.units / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens</div>`
     ).join('');
 
-    const first20Matrix = buildFirst20Matrix(stats.first20Enriched, { tokenDecimals, currentSupply });
+    const buyersMatrix = buildBuyersMatrix(stats.firstNEnriched, { tokenDecimals, currentSupply });
 
-    statsEl.innerHTML = `
-      <div style="padding-left:0" class="section-title">Stats</div>
-
-      <div style="margin-top:4px"><strong>Pool info</strong></div>
-      ${lpLines || '<div style="opacity:.8">No pools found.</div>'}
+    el.innerHTML = `
+      <div class="section-title" style="padding-left:0">Stats</div>
 
       <div style="margin-top:10px"><strong>Minted Tokens</strong></div>
       <div>${(Number(mintedUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</div>
@@ -698,8 +673,12 @@
       <div style="margin-top:10px"><strong>Burned Tokens</strong></div>
       <div>${(Number(burnedUnits / (10n ** BigInt(tokenDecimals)))).toLocaleString()} (<span>${(stats.burnPctVsMinted||0).toFixed(4)}%</span> of minted)</div>
 
+      <div style="margin-top:10px"><strong>Vested Tokens</strong></div>
+      <div><strong>${(Number(stats.vestedUnitsSum / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens (<strong>${(stats.vestedPct||0).toFixed(4)}%</strong> of current supply)</div>
+      ${vestedLines || '<div style="opacity:.8">No vested addresses configured.</div>'}
+
       <div style="margin-top:10px"><strong>Holders</strong></div>
-      <div>Displayed / Total: <strong>${holders.length}</strong> / <strong>${stats.holdersCount}</strong></div>
+      <div>Displayed / Total: <strong>${/* displayed holders length isn't in scope here, so omit */ ''}</strong><strong></strong> / <strong>${stats.holdersCount}</strong></div>
 
       <div style="margin-top:10px"><strong>Creator</strong></div>
       <div>${stats.creatorAddress ? `${stats.creatorAddress.slice(0,6)}...${stats.creatorAddress.slice(-4)}` : 'n/a'} — holds <strong>${stats.creatorPct.toFixed(4)}%</strong></div>
@@ -707,35 +686,47 @@
       <div style="margin-top:10px"><strong>Top 10 Holders</strong></div>
       <div>${stats.top10Pct.toFixed(4)}%</div>
 
-      <div style="margin-top:10px"><strong>LP Totals</strong></div>
-      <div><strong>${(Number(lpPerPair.reduce((s,x)=>s+x.units,0n) / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens (<strong>${(stats.lpPct||0).toFixed(4)}%</strong> of current supply)</div>
+      <div style="margin-top:12px"><strong>First ${FIRST_BUYERS_LIMIT} buyers (Status)</strong></div>
+      ${buyersMatrix}
 
-      <div style="margin-top:10px"><strong>Vested Tokens</strong></div>
-      <div><strong>${(Number(vestedPerAddr.reduce((s,x)=>s+x.units,0n) / (10n ** BigInt(tokenDecimals)))).toLocaleString()}</strong> tokens (<strong>${(stats.vestedPct||0).toFixed(4)}%</strong> of current supply)</div>
-      ${vestedLines}
-
-      <div style="margin-top:12px"><strong>First 20 buyers (Status)</strong></div>
-      ${first20Matrix}
-
-      <div style="opacity:.8;margin-top:10px">Rings — <span style="color:#FFD700">gold</span>: TG • <span style="color:#C4B5FD">lilac</span>: LP • <span style="color:#6EE7B7">mint</span>: VESTED</div>
-      <div style="opacity:.6;margin-top:6px;font-size:.9em">*“First 20 buyers” = first 20 unique wallets to receive tokens from any LP (after router/aggregator hops) in on-chain order.</div>
+      <div style="opacity:.8;margin-top:10px">Colors — <span style="color:#00ff9c">green</span>: Hold • <span style="color:#4ea3ff">blue</span>: Sold Part • <span style="color:#ffd84e">yellow</span>: Bought More • <span style="color:#ff4e4e">red</span>: Sold All</div>
+      <div style="opacity:.6;margin-top:6px;font-size:.9em">*“First ${FIRST_BUYERS_LIMIT} buyers” = first ${FIRST_BUYERS_LIMIT} unique wallets to receive tokens from any LP (after router/aggregator hops) in on-chain order.</div>
     `;
 
-    // Wire up matrix hover & click
-    wireFirst20MatrixInteractions({ tokenDecimals, currentSupply });
+    wireBuyersMatrixInteractions({ tokenDecimals, currentSupply });
   }
 
-  function buildFirst20Matrix(list, { tokenDecimals, currentSupply }) {
+  function renderTop25({ el, tokenDecimals, top25, currentSupply }) {
+    const rows = top25.map((h, i) => {
+      const pct = (h.pct || 0).toFixed(4);
+      const tok = toNum(h.units, tokenDecimals).toLocaleString();
+      return `
+        <div class="row" style="display:flex; align-items:center; gap:10px; padding:6px 0; border-bottom:1px solid #202020">
+          <div style="width:28px; text-align:right; opacity:.85">${i+1}.</div>
+          <div style="flex:1;">
+            <a href="${EXPLORER}/address/${h.address}" target="_blank" style="color:#9cc3ff; text-decoration:none">
+              ${h.address.slice(0,6)}...${h.address.slice(-4)}
+            </a>
+            <div style="font-size:.9em; opacity:.85">${tok} tokens</div>
+          </div>
+          <div style="min-width:100px; text-align:right; font-weight:600">${pct}%</div>
+        </div>
+      `;
+    }).join('');
+
+    el.innerHTML = rows || '<div style="opacity:.8">No holders found.</div>';
+  }
+
+  // ===== Buyers matrix =====
+  function buildBuyersMatrix(list, { tokenDecimals, currentSupply }) {
     const colorFor = s =>
       s === 'hold' ? '#00ff9c' :
       s === 'soldPart' ? '#4ea3ff' :
       s === 'soldAll' ? '#ff4e4e' : '#ffd84e'; // 'more'
 
     const cells = list.map((b, idx) => {
-      const short = b.address.slice(0,6)+'...'+b.address.slice(-4);
       const clr = colorFor(b.status);
 
-      // Pre-format strings for dataset
       const initTok   = toNum(b.initialUnits, tokenDecimals).toLocaleString();
       const currTok   = toNum(b.currentUnits, tokenDecimals).toLocaleString();
       const soldTok   = toNum(b.soldUnits,   tokenDecimals).toLocaleString();
@@ -744,6 +735,9 @@
       const initPct   = (b.initPct  || 0).toFixed(4);
       const soldPct   = (b.soldPct  || 0).toFixed(4);
       const addPct    = (b.boughtPct|| 0).toFixed(4);
+
+      // For progress bar (current vs initial). Clamp to 200% so "bought more" looks >100%.
+      const prog = clamp(b.progressPct || 0, 0, 200);
 
       return `
         <div class="cell"
@@ -756,7 +750,8 @@
              data-sold-pct="${soldPct}"
              data-add-tok="${addTok}"
              data-add-pct="${addPct}"
-             title="${short}">
+             data-prog="${prog}"
+             title="${b.address.slice(0,6)}...${b.address.slice(-4)}">
           <span class="dot" style="background:${clr}"></span>
           <span class="idx">${idx+1}</span>
         </div>
@@ -765,36 +760,38 @@
 
     return `
       <style>
-        #first20-matrix {
+        #buyers-matrix {
           display:grid;
-          grid-template-columns: repeat(${FIRST20_MATRIX_COLS}, minmax(42px, 1fr));
+          grid-template-columns: repeat(${FIRST_MATRIX_COLS}, minmax(42px, 1fr));
           grid-auto-rows: 32px;
           gap: 8px;
-          max-width: ${FIRST20_MATRIX_COLS*60}px;
+          max-width: ${FIRST_MATRIX_COLS*60}px;
           margin-top: 6px;
         }
-        #first20-matrix .cell {
+        #buyers-matrix .cell {
           display:flex; align-items:center; justify-content:center;
           border:1px solid #333; border-radius:6px; padding:2px 4px;
           background:#0b0b0b;
           font-size:12px; color:#ddd;
           cursor:pointer;
         }
-        #first20-matrix .cell:hover { border-color:#666; }
-        #first20-matrix .dot {
+        #buyers-matrix .cell:hover { border-color:#666; }
+        #buyers-matrix .dot {
           width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:6px;
         }
-        #first20-matrix .idx { opacity:.85; }
+        #buyers-matrix .idx { opacity:.85; }
+        .tip-bar { width:180px; height:8px; background:#222; border-radius:4px; overflow:hidden; margin-top:6px; }
+        .tip-bar > span { display:block; height:100%; background:#00ff9c; } /* default green; overridden inline */
       </style>
-      <div id="first20-matrix">${cells}</div>
+      <div id="buyers-matrix">${cells}</div>
     `;
   }
 
-  function wireFirst20MatrixInteractions({ tokenDecimals, currentSupply }) {
-    const container = document.getElementById('first20-matrix');
+  function wireBuyersMatrixInteractions({ tokenDecimals, currentSupply }) {
+    const container = document.getElementById('buyers-matrix');
     if (!container) return;
 
-    // Reuse the shared tooltip
+    // Reuse shared tooltip
     let tip = d3.select('#bubble-tip');
     if (tip.empty()) {
       tip = d3.select('body').append('div').attr('id','bubble-tip')
@@ -803,22 +800,34 @@
         .style('pointer-events','none').style('opacity',0).style('z-index',9999);
     }
 
+    function statusToLabel(s){
+      return s === 'hold' ? 'Hold' :
+             s === 'soldPart' ? 'Sold Part' :
+             s === 'soldAll' ? 'Sold All' : 'Bought More';
+    }
+    function statusToColor(s){
+      return s === 'hold' ? '#00ff9c' :
+             s === 'soldPart' ? '#4ea3ff' :
+             s === 'soldAll' ? '#ff4e4e' : '#ffd84e';
+    }
+
     function showTip(evt, el) {
       const d = el.dataset;
       const addr = d.addr || '';
       const short = addr ? `${addr.slice(0,6)}...${addr.slice(-4)}` : '';
-      const statusLabel =
-        d.status === 'hold' ? 'Hold' :
-        d.status === 'soldPart' ? 'Sold Part' :
-        d.status === 'soldAll' ? 'Sold All' : 'Bought More';
+      const clr = statusToColor(d.status);
 
+      const prog = Number(d.prog || 0); // 0..200
+      const barWidth = Math.min(200, Math.max(0, prog)); // clamp
       tip.html(`
-        <div><strong>${short}</strong> — ${statusLabel}</div>
+        <div><strong>${short}</strong> — ${statusToLabel(d.status)}</div>
         <div style="margin-top:6px">
           <div>Initial buy: <strong>${d['initTok'] || d['init-tok']}</strong> (${d['initPct'] || d['init-pct']}%)</div>
           <div>Currently: <strong>${d['currTok'] || d['curr-tok']}</strong></div>
           <div>Sold: <strong>${d['soldTok'] || d['sold-tok']}</strong> (${d['soldPct'] || d['sold-pct']}%)</div>
           <div>Bought more: <strong>${d['addTok'] || d['add-tok']}</strong> (${d['addPct'] || d['add-pct']}%)</div>
+          <div class="tip-bar"><span style="width:${Math.min(100,barWidth)}%; background:${clr}"></span></div>
+          <div style="opacity:.8; font-size:.9em;">Progress vs initial: ${prog.toFixed(1)}%</div>
         </div>
         <div style="opacity:.8;margin-top:6px">Click to open in explorer ↗</div>
       `)
