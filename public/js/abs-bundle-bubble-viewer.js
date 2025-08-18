@@ -18,22 +18,22 @@
 
 (() => {
   // ===== FRONTEND PROXY WRAPPER (leave BASE as upstream; we rewrite to /api/abs) =====
-  (() => {
-    const ABS_UPSTREAM  = "https://api.etherscan.io/v2/api";
-    const ABS_PROXY_PATH = "/api/abs";   // your VPS proxy route
-    const origFetch = window.fetch.bind(window);
-    window.fetch = (input, init) => {
-      const url = typeof input === "string" ? input : (input && input.url) || "";
-      if (typeof url === "string" && url.startsWith(ABS_UPSTREAM)) {
-        const u = new URL(url);
-        // never send apikey from the browser
-        u.searchParams.delete("apikey");
-        const proxied = `${ABS_PROXY_PATH}?${u.searchParams.toString()}`;
-        return origFetch(proxied, init);
-      }
-      return origFetch(input, init);
-    };
-  })();
+// === ABS proxy fetch rewriter (routes upstream to /api/abs) ===
+(() => {
+  const ABS_UPSTREAM   = "https://api.etherscan.io/v2/api";
+  const ABS_PROXY_PATH = "/api/abs";
+  const origFetch = window.fetch.bind(window);
+  window.fetch = (input, init) => {
+    const url = typeof input === "string" ? input : (input && input.url) || "";
+    if (typeof url === "string" && url.startsWith(ABS_UPSTREAM)) {
+      const u = new URL(url);
+      u.searchParams.delete("apikey"); // never send a key from browser
+      return origFetch(`${ABS_PROXY_PATH}?${u.searchParams.toString()}`, init);
+    }
+    return origFetch(input, init);
+  };
+})();
+
 
   // ===== CONFIG =====
   const API_KEY   = ""; // no key in browser
