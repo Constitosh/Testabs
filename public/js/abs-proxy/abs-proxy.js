@@ -1,12 +1,18 @@
 // abs-proxy.js
 const express = require("express");
-require("dotenv").config();
+const path = require("path");
 
-// Use native fetch if available (Node 18+), otherwise fallback to node-fetch (Node 16)
+// Load .env next to this file, regardless of CWD
+require("dotenv").config({ path: path.join(__dirname, ".env") });
+
+// Use native fetch on Node 18+, fallback to node-fetch on older Node
 let fetchFn = global.fetch;
 if (!fetchFn) {
   try { fetchFn = require("node-fetch"); }
-  catch { console.error("Install node-fetch or upgrade Node to v18+: `npm i node-fetch@2`"); process.exit(1); }
+  catch {
+    console.error("Install node-fetch or upgrade Node to v18+: `npm i node-fetch@2`");
+    process.exit(1);
+  }
 }
 
 const app = express();
