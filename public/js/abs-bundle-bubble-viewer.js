@@ -1,23 +1,43 @@
 /*
-  Totally ABS Bubble Viewer — v5.3
+  Totally ABS Bubble Viewer — v5.4
   ------------------------------------------------------------
-  NEW (matrix upgrades)
-    • First 20 buyers matrix cells now show rich hover details:
-      - Initial buy (tokens + % of current supply)
-      - Sold amount (tokens + %)
-      - Bought additionally (tokens + %)
-    • Clicking a matrix cell opens the buyer in the explorer.
+  Fixes:
+    • First-20 buyers matrix now collects up to 20 UNIQUE buyers:
+      - Consider every tx that has LP -> X transfers (not just the first tx)
+      - In a single tx, we consider ALL LP->X seeds (sorted by amount) and gather unique final recipients
+      - BFS hop-through inside the same tx to resolve router/aggregator hops to the final wallet
+      - Keep strict chronological order across txs
 
-  Earlier fixes kept:
-    • Real "first 20 buys" (LP → router hop-through → final recipient in same tx)
-    • Status (Hold / Sold Part / Sold All / Bought More) = current balance vs first-buy amount
-    • Multi-LP, VESTED bubbles, circulating reconciliation, etc.
+  Matrix:
+    • Hover: shows initial buy, sold, bought-more (tokens + % of current supply)
+    • Click: opens wallet on ABScan
+
+  API key:
+    • No real key in browser. Wrapper routes ABS calls to /api/abs (your VPS proxy that injects key from .env)
 */
 
 (() => {
+  // ===== FRONTEND PROXY WRAPPER (leave BASE as upstream; we rewrite to /api/abs) =====
+  (() => {
+    const ABS_UPSTREAM  = "https://api.etherscan.io/v2/api";
+    const ABS_PROXY_PATH = "/api/abs";   // your VPS proxy route
+    const origFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : (input && input.url) || "";
+      if (typeof url === "string" && url.startsWith(ABS_UPSTREAM)) {
+        const u = new URL(url);
+        // never send apikey from the browser
+        u.searchParams.delete("apikey");
+        const proxied = `${ABS_PROXY_PATH}?${u.searchParams.toString()}`;
+        return origFetch(proxied, init);
+      }
+      return origFetch(input, init);
+    };
+  })();
+
   // ===== CONFIG =====
-  const API_KEY   = "H13F5VZ64YYK4M21QMPEW78SIKJS85UTWT";
-  const BASE      = "https://api.etherscan.io/v2/api"; // ABS-compatible
+  const API_KEY   = ""; // no key in browser
+  const BASE      = "https://api.etherscan.io/v2/api"; // will be rewritten to /api/abs by wrapper
   const CHAIN_ID  = 2741;
   const EXPLORER  = "https://explorer.mainnet.abs.xyz";
 
@@ -27,6 +47,7 @@
   const KNOWN_SYSTEM_ADDRESSES = new Set([
     TG_BOT_ADDRESS,
     "0xcca5047e4c9f9d72f11c199b4ff1960f88a4748d".toLowerCase(), // router-like
+    // add more if you discover them
   ]);
 
   // Always exclude (never count as holder/circulating)
@@ -35,7 +56,6 @@
   // VESTED addresses — excluded from holders/circulating; shown as teal bubbles
   const VESTED_ADDRESSES_GLOBAL = new Set([]);
   const VESTED_ADDRESSES_BY_TOKEN = {
-    // example:
     // "0xd5cc17f92b41d57a4b34d4b08587bf55342d4bc1": ["0x1d48d1cb9b51dbed2443d7451eae1060ccc27ba8"]
   };
 
@@ -117,7 +137,7 @@
     const offset = 10000;
     let page = 1;
     while (true) {
-      const url = `${BASE}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&page=${page}&offset=${offset}&sort=asc&apikey=${API_KEY}`;
+      const url = `${BASE}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&page=${page}&offset=${offset}&sort=asc`;
       const r = await fetch(url);
       const j = await r.json();
       const arr = Array.isArray(j?.result) ? j.result : [];
@@ -128,7 +148,7 @@
       if (page > 200) break;
     }
     if (!all.length) {
-      const url = `${BASE}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&startblock=0&endblock=99999999&sort=asc&apikey=${API_KEY}`;
+      const url = `${BASE}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&startblock=0&endblock=99999999&sort=asc`;
       const r = await fetch(url);
       const j = await r.json();
       const arr = Array.isArray(j?.result) ? j.result : [];
@@ -136,9 +156,26 @@
     }
     return all;
   }
+  async function fetchAllNativeTx(address, untilTs) {
+    const all = [];
+    const offset = 10000;
+    let page = 1;
+    while (true) {
+      const url = `${BASE}?chainid=${CHAIN_ID}&module=account&action=txlist&address=${address}&page=${page}&offset=${offset}&sort=asc`;
+      const r = await fetch(url);
+      const j = await r.json();
+      const arr = Array.isArray(j?.result) ? j.result : [];
+      if (!arr.length) break;
+      all.push(...arr);
+      if (arr.length < offset) break;
+      page++;
+      if (page > 200) break;
+    }
+    return untilTs ? all.filter(t => Number(t.timeStamp) <= untilTs) : all;
+  }
   async function tokenBalanceOf(contract, holder) {
     try {
-      const u = `${BASE}?chainid=${CHAIN_ID}&module=account&action=tokenbalance&address=${holder}&contractaddress=${contract}&tag=latest&apikey=${API_KEY}`;
+      const u = `${BASE}?chainid=${CHAIN_ID}&module=account&action=tokenbalance&address=${holder}&contractaddress=${contract}&tag=latest`;
       const r = await fetch(u);
       const j = await r.json();
       const raw = j?.result;
@@ -147,7 +184,7 @@
     return null;
   }
 
-  // ===== FIRST 20 REAL BUYS (LP → router hop-through → final) =====
+  // ===== FIRST 20 REAL BUYS (enhanced) =====
   function groupByHashAscending(txs) {
     const groups = new Map();
     for (const t of txs) {
@@ -162,9 +199,11 @@
       const ab = Number(A[0].blockNumber || 0), bb = Number(B[0].blockNumber || 0);
       return ab - bb;
     });
+    // stabilize each group as well
+    for (const g of arr) g.sort((x,y)=> Number(x.logIndex||0) - Number(y.logIndex||0));
     return arr;
   }
-  function resolveFinalRecipientInTx(group, seed, {excluded, pairSet, maxDepth = 3}) {
+  function resolveFinalRecipientInTx(group, seed, {excluded, pairSet, maxDepth = 4}) {
     const edges = new Map(); // from -> [to...]
     for (const t of group) {
       const f = (t.from || t.fromAddress).toLowerCase();
@@ -201,45 +240,46 @@
     }
     return sum;
   }
+
+  /**
+   * Enhanced picker:
+   * For each tx group containing LP->X transfers, consider ALL such transfers in that tx
+   * (sorted by value desc). For each seed, resolve a final recipient via BFS. If new & has
+   * non-zero credit in this tx, add it. Continue across groups until we have 20 unique buyers.
+   */
   function findFirst20RealBuys({txs, pairSet, excluded}) {
     const groups = groupByHashAscending(txs);
     const buyers = [];
     const seen = new Set();
 
-    for (const group of groups) {
+    outer: for (const group of groups) {
       const lpTransfers = group.filter(t => pairSet.has((t.from || t.fromAddress).toLowerCase()));
       if (!lpTransfers.length) continue;
 
+      // Consider ALL seeds in this tx (largest first)
       lpTransfers.sort((a, b) => {
         const av = toBI(a.value), bv = toBI(b.value);
         return (bv > av) ? 1 : (bv < av) ? -1 : 0;
       });
 
-      let finalBuyer = null;
-      let finalAmount = 0n;
-
       for (const seedT of lpTransfers) {
         const seed = (seedT.to || seedT.toAddress).toLowerCase();
-        const resolved = resolveFinalRecipientInTx(group, seed, {excluded, pairSet, maxDepth: 3});
+        const resolved = resolveFinalRecipientInTx(group, seed, {excluded, pairSet, maxDepth: 4});
         if (!resolved || seen.has(resolved)) continue;
+
         const credit = sumCreditsToInTx(group, resolved);
         if (credit === 0n) continue;
 
-        finalBuyer = resolved;
-        finalAmount = credit;
-        break;
-      }
-
-      if (finalBuyer) {
         buyers.push({
-          address: finalBuyer,
-          initialUnits: finalAmount,                         // BigInt
+          address: resolved,
+          initialUnits: credit,
           ts: Number(group[0].timeStamp) || Date.now()/1000
         });
-        seen.add(finalBuyer);
-        if (buyers.length >= 20) break;
+        seen.add(resolved);
+        if (buyers.length >= 20) break outer;
       }
     }
+
     buyers.sort((a,b)=> a.ts - b.ts);
     return buyers;
   }
@@ -317,7 +357,7 @@
       // Creator (optional)
       let creatorAddress = '';
       try {
-        const cUrl = `${BASE}?chainid=${CHAIN_ID}&module=contract&action=getcontractcreation&contractaddresses=${contract}&apikey=${API_KEY}`;
+        const cUrl = `${BASE}?chainid=${CHAIN_ID}&module=contract&action=getcontractcreation&contractaddresses=${contract}`;
         const cRes = await fetch(cUrl);
         const cData = await cRes.json();
         creatorAddress = (Array.isArray(cData?.result) && cData.result[0]?.contractCreator)
@@ -452,7 +492,11 @@
       const burnPctVsMinted   = minted > 0n ? pctUnits(burned, minted) : 0;
 
       // ===== First 20 real buys + enriched stats for matrix =====
-      const first20 = findFirst20RealBuys({ txs, pairSet, excluded: new Set([...excluded, contract]) });
+      const first20 = findFirst20RealBuys({
+        txs,
+        pairSet,
+        excluded: new Set([...excluded, contract])
+      });
 
       const first20Enriched = first20.map((b) => {
         const addr = b.address;
@@ -507,7 +551,7 @@
         circulatingTrackedUnits, circulatingRecon,
         addrToBundle: {},         // (optional: fill if you color by funders)
         tgRecipients,
-        addrFlags: {},            // (optional: snipe/insider flags)
+        addrFlags: {},            // (optional: flags)
         lpPerPair, vestedPerAddr,
         viaProxyOf: {},           // (optional: proxy-split rings)
         stats: {
@@ -702,7 +746,6 @@
   }
 
   function buildFirst20Matrix(list, { tokenDecimals, currentSupply }) {
-    // 5 x 4 grid, ordered by timestamp; hover & click are wired after insertion.
     const colorFor = s =>
       s === 'hold' ? '#00ff9c' :
       s === 'soldPart' ? '#4ea3ff' :
@@ -712,7 +755,7 @@
       const short = b.address.slice(0,6)+'...'+b.address.slice(-4);
       const clr = colorFor(b.status);
 
-      // Pre-format strings for dataset (so listeners don’t recompute)
+      // Pre-format strings for dataset
       const initTok   = toNum(b.initialUnits, tokenDecimals).toLocaleString();
       const currTok   = toNum(b.currentUnits, tokenDecimals).toLocaleString();
       const soldTok   = toNum(b.soldUnits,   tokenDecimals).toLocaleString();
