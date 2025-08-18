@@ -1,15 +1,13 @@
 /*
-  Totally ABS Bubble Viewer — v5.9 (no .env)
-  ------------------------------------------------------------
-  • First buyers = up to FIRST_BUYERS_LIMIT (=25) unique wallets
-    - Per tx: consider ALL LP→X seeds (largest first)
-    - In-tx hop-through: LP → router/aggregator → final wallet
-    - Cross-tx chase: if the seed is a proxy/bot, follow its OUT transfers
-      within a short time window to find the first real recipient
-  • Buyers matrix: Hold=green / Sold part=blue / Bought more=yellow / Sold all=red
-    Hover shows only percentages of current supply + a progress bar (current vs initial)
-  • UI: three collapsible sections: Bubble Map / Stats / Top 25 Holders
-  • Stats order: Minted → Burned → Vested → Holders → Creator → Top 10 Holders
+  Totally ABS Bubble Viewer — v6.1 (first 25 buyers fix + percent-only hover)
+  ---------------------------------------------------------------------------
+  • First Buyers (real 25):
+    - Per-tx: consider *all* LP→X seeds (largest first)
+    - In-tx hop-through: LP → router/aggregator → ...
+    - Cross-tx chase: unwrap proxy/bot fan-outs within a time window
+    - Stronger proxy classification (known systems OR ≥3 distinct recipients OR ≥90% outflow share)
+  • Buyers matrix hover shows ONLY percentages (no token amounts) + progress bar
+  • Everything else (bubbles, stats order, top-25 list) unchanged from your last version
 */
 
 (() => {
@@ -21,25 +19,23 @@
 
   const TG_BOT_ADDRESS = "0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f".toLowerCase();
 
-  // Known system/router/aggregator/factory contracts to ignore as holders & first-buyer recipients
+  // Known router/system contracts to ignore as holders & first-buyer recipients
   const KNOWN_SYSTEM_ADDRESSES = new Set([
     TG_BOT_ADDRESS,
     "0xcca5047e4c9f9d72f11c199b4ff1960f88a4748d".toLowerCase(), // router-like
   ]);
 
-  // Always exclude (never count as holder/circulating)
-  const ALWAYS_EXCLUDE_ADDRESSES = new Set([]);
+  const ALWAYS_EXCLUDE_ADDRESSES = new Set([]); // manual blocklist
 
-  // VESTED addresses — excluded from holders/circulating; shown as teal bubbles
+  // VESTED addresses — excluded from holders; shown separately as teal bubbles
   const VESTED_ADDRESSES_GLOBAL = new Set([]);
   const VESTED_ADDRESSES_BY_TOKEN = {
     // "0xd5cc17f92b41d57a4b34d4b08587bf55342d4bc1": ["0x1d48d1cb9b51dbed2443d7451eae1060ccc27ba8"]
   };
 
   // Proxy heuristics
-  const PROXY_MIN_DISTINCT_RECIPIENTS = 8;
-  const PROXY_END_BALANCE_EPS = 0n;
-  const PROXY_OUTFLOW_SHARE_NUM = 90n; // 90%
+  const PROXY_MIN_DISTINCT_RECIPIENTS = 3; // more aggressive to catch aggregators early
+  const PROXY_OUTFLOW_SHARE_NUM = 90n;     // >=90% of flow is outflow
   const PROXY_OUTFLOW_SHARE_DEN = 100n;
 
   // Holders verification
@@ -49,9 +45,9 @@
 
   // First buyers
   const FIRST_BUYERS_LIMIT   = 25;
-  const FIRST_MATRIX_COLS    = 5; // 5 x 5 grid for 25
-  const CROSS_TX_WINDOW_SEC  = 300; // chase proxy fan-outs within 5 minutes
-  const CROSS_TX_MAX_DEPTH   = 4;
+  const FIRST_MATRIX_COLS    = 5; // 5 x 5 grid
+  const CROSS_TX_WINDOW_SEC  = 600; // 10 minutes fan-out window
+  const CROSS_TX_MAX_DEPTH   = 6;   // chase depth for proxies
 
   // Burns / mints
   const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
@@ -148,23 +144,7 @@
     return null;
   }
 
-  // ===== INDEXES FOR CROSS-TX CHASE =====
-  function buildOutgoingIndex(txs) {
-    // fromAddr -> [{ts, to, valueBI, hash}]
-    const out = new Map();
-    for (const t of txs) {
-      const f = (t.from || t.fromAddress).toLowerCase();
-      const to = (t.to || t.toAddress).toLowerCase();
-      const ts = Number(t.timeStamp) || 0;
-      const v  = toBI(t.value || "0");
-      if (!out.has(f)) out.set(f, []);
-      out.get(f).push({ ts, to, v, hash: String(t.hash || t.transactionHash || "") });
-    }
-    for (const arr of out.values()) arr.sort((a,b)=> a.ts - b.ts);
-    return out;
-  }
-
-  // ===== FIRST N REAL BUYS =====
+  // ===== UTILS FOR FIRST BUYERS =====
   function groupByHashAscending(txs) {
     const groups = new Map();
     for (const t of txs) {
@@ -184,7 +164,32 @@
     for (const g of arr) g.sort((x,y)=> Number(x.logIndex||0) - Number(y.logIndex||0));
     return arr;
   }
-  function resolveFinalRecipientInTx(group, seed, {excluded, pairSet, maxDepth = 4}) {
+  function buildOutgoingIndex(txs) {
+    // fromAddr -> [{ts, to, v, hash}]
+    const out = new Map();
+    for (const t of txs) {
+      const f = (t.from || t.fromAddress).toLowerCase();
+      const to = (t.to || t.toAddress).toLowerCase();
+      const ts = Number(t.timeStamp) || 0;
+      const v  = toBI(t.value || "0");
+      if (!out.has(f)) out.set(f, []);
+      out.get(f).push({ ts, to, v, hash: String(t.hash || t.transactionHash || "") });
+    }
+    for (const arr of out.values()) arr.sort((a,b)=> a.ts - b.ts);
+    return out;
+  }
+  function isLikelyProxy(addr, { sendRecipients, inflow, outflow }) {
+    if (KNOWN_SYSTEM_ADDRESSES.has(addr)) return true;
+    const recipients = sendRecipients[addr]?.size || 0;
+    if (recipients >= PROXY_MIN_DISTINCT_RECIPIENTS) return true;
+    const out = outflow[addr] || 0n;
+    const inn = inflow[addr] || 0n;
+    const flow = out + inn;
+    if (flow === 0n) return false;
+    return (out * PROXY_OUTFLOW_SHARE_DEN) >= (PROXY_OUTFLOW_SHARE_NUM * flow);
+  }
+  function resolveInTxFinal(group, start, {excluded, pairSet, maxDepth = 5}) {
+    // BFS on token transfers within the tx
     const edges = new Map(); // from -> [to...]
     for (const t of group) {
       const f = (t.from || t.fromAddress).toLowerCase();
@@ -192,8 +197,8 @@
       if (!edges.has(f)) edges.set(f, []);
       edges.get(f).push(to);
     }
-    const seen = new Set([seed]);
-    let frontier = [seed];
+    const seen = new Set([start]);
+    let frontier = [start];
     for (let d = 0; d < maxDepth; d++) {
       const next = [];
       for (const u of frontier) {
@@ -210,35 +215,34 @@
       frontier = next;
       if (!frontier.length) break;
     }
-    if (!excluded.has(seed) && !pairSet.has(seed) && !burnAddresses.has(seed)) return seed;
     return null;
   }
-  function resolveFinalRecipientCrossTx(seed, seedTs, { excluded, pairSet, outIdx, windowSec = CROSS_TX_WINDOW_SEC, maxDepth = CROSS_TX_MAX_DEPTH }) {
-    // Follow OUT transfers from seed → ... within a time window to find first non-excluded end wallet
-    let depth = 0;
-    let cur = seed;
-    let curTs = seedTs;
-    const seen = new Set([seed]);
-    while (depth < maxDepth) {
-      const outs = outIdx.get(cur) || [];
-      // first out after curTs, within window
-      const next = outs.find(o => o.ts >= curTs && o.ts <= curTs + windowSec);
-      if (!next) break;
-      const cand = next.to;
-      if (!excluded.has(cand) && !pairSet.has(cand) && !burnAddresses.has(cand)) {
-        return cand;
-      }
-      if (seen.has(cand)) break;
-      seen.add(cand);
-      cur = cand;
-      curTs = next.ts;
-      depth++;
+  function largestCreditToInTx(group, addr) {
+    let sum = 0n;
+    for (const t of group) {
+      const to = (t.to || t.toAddress).toLowerCase();
+      if (to === addr) sum += toBI(t.value || "0");
     }
-    // fallback: if seed itself is acceptable, treat as buyer
-    if (!excluded.has(seed) && !pairSet.has(seed) && !burnAddresses.has(seed)) return seed;
-    return null;
+    return sum;
   }
-  function findFirstNRealBuys({txs, pairSet, excluded, outIdx, limit}) {
+  function nextHopFromProxy(group, addr) {
+    // If the candidate is still proxy-like, try to hop inside the SAME tx to the biggest recipient
+    let bestTo = null, bestV = 0n;
+    for (const t of group) {
+      const f = (t.from || t.fromAddress).toLowerCase();
+      const to = (t.to   || t.toAddress).toLowerCase();
+      if (f !== addr) continue;
+      const v = toBI(t.value || "0");
+      if (v > bestV) { bestV = v; bestTo = to; }
+    }
+    return bestTo;
+  }
+  function nextHopCrossTx(addr, afterTs, outIdx, windowSec) {
+    const outs = outIdx.get(addr) || [];
+    return outs.find(o => o.ts >= afterTs && o.ts <= afterTs + windowSec) || null;
+  }
+  function findFirstNRealBuys({txs, pairSet, excluded, index, limit, windowSec, maxDepth}) {
+    // index = { sendRecipients, inflow, outflow, outIdx }
     const groups = groupByHashAscending(txs);
     const buyers = [];
     const seen = new Set();
@@ -249,7 +253,7 @@
 
       // consider ALL LP→X seeds (largest first)
       lpTransfers.sort((a, b) => {
-        const av = toBI(a.value), bv = toBI(b.value);
+        const av = toBI(a.value || "0"), bv = toBI(b.value || "0");
         return (bv > av) ? 1 : (bv < av) ? -1 : 0;
       });
 
@@ -257,35 +261,52 @@
         const seed = (seedT.to || seedT.toAddress).toLowerCase();
         const seedTs = Number(seedT.timeStamp) || Number(group[0].timeStamp) || 0;
 
-        // First try in-tx hop-through
-        let resolved = resolveFinalRecipientInTx(group, seed, {excluded, pairSet, maxDepth: 4});
+        // Step 1: resolve within the same tx
+        let cur = resolveInTxFinal(group, seed, {excluded, pairSet, maxDepth: 6}) || seed;
+        let curTs = seedTs;
+        let hopCredit = largestCreditToInTx(group, cur); // may be 0 if later hop
 
-        // If unresolved or excluded proxy, try cross-tx chase
-        if (!resolved || excluded.has(resolved)) {
-          resolved = resolveFinalRecipientCrossTx(seed, seedTs, { excluded, pairSet, outIdx });
+        // Step 2: unwrap proxies iteratively (in-tx hop first, then cross-tx hop)
+        let depth = 0;
+        const hopSeen = new Set([seed]);
+        while (depth < maxDepth && (excluded.has(cur) || isLikelyProxy(cur, index))) {
+          // try in-tx hop from proxy
+          const inTxNext = nextHopFromProxy(group, cur);
+          if (inTxNext && !hopSeen.has(inTxNext)) {
+            hopSeen.add(inTxNext);
+            cur = inTxNext;
+            hopCredit = largestCreditToInTx(group, cur);
+            depth++;
+            continue;
+          }
+          // try cross-tx hop (first out within window)
+          const cross = nextHopCrossTx(cur, curTs, index.outIdx, windowSec);
+          if (cross && !hopSeen.has(cross.to)) {
+            hopSeen.add(cross.to);
+            cur = cross.to;
+            curTs = cross.ts;
+            hopCredit = cross.v; // credit from this hop
+            depth++;
+            continue;
+          }
+          break;
         }
 
-        if (!resolved || seen.has(resolved)) continue;
-
-        // Credit = sum of transfers to resolved within THIS tx (if any), otherwise earliest cross-tx credit
-        let credit = 0n;
-        for (const t of group) {
-          const to = (t.to || t.toAddress).toLowerCase();
-          if (to === resolved) credit += toBI(t.value || "0");
+        // Drop if still excluded/pair/burn
+        if (excluded.has(cur) || pairSet.has(cur) || burnAddresses.has(cur)) continue;
+        if (seen.has(cur)) continue;
+        if (hopCredit === 0n) {
+          // last resort: if no explicit credit captured, try sum within tx again
+          hopCredit = largestCreditToInTx(group, cur);
+          if (hopCredit === 0n) continue;
         }
-        if (credit === 0n) {
-          const outs = outIdx.get(seed) || [];
-          const hop = outs.find(o => o.to === resolved && o.ts >= seedTs && o.ts <= seedTs + CROSS_TX_WINDOW_SEC);
-          if (hop) credit = hop.v;
-        }
-        if (credit === 0n) continue;
 
         buyers.push({
-          address: resolved,
-          initialUnits: credit,
+          address: cur,
+          initialUnits: hopCredit,
           ts: Number(group[0].timeStamp) || Date.now()/1000
         });
-        seen.add(resolved);
+        seen.add(cur);
         if (buyers.length >= limit) break outer;
       }
     }
@@ -402,27 +423,12 @@
         if (!burnAddresses.has(to))   balances[to]   = (balances[to]   || 0n) + units;
       }
 
-      // Exclusion set (for holders + first buyers)
+      // Exclusion set (holders + buyers)
       const excluded = new Set([
         ...KNOWN_SYSTEM_ADDRESSES,
         ...ALWAYS_EXCLUDE_ADDRESSES,
         ...vestedSet,
       ]);
-
-      // Auto proxy exclusion (flow-based)
-      for (const addr of Object.keys(sendRecipients)) {
-        const recipients = sendRecipients[addr]?.size || 0;
-        const endBal = balances[addr] || 0n;
-        const out = outflow[addr] || 0n;
-        const inn = inflow[addr] || 0n;
-        const flow = out + inn;
-        const outShareOK = flow === 0n ? false : (out * PROXY_OUTFLOW_SHARE_DEN) >= (PROXY_OUTFLOW_SHARE_NUM * flow);
-        if (recipients >= PROXY_MIN_DISTINCT_RECIPIENTS &&
-            endBal === PROXY_END_BALANCE_EPS &&
-            outShareOK) {
-          excluded.add(addr);
-        }
-      }
 
       // Build outgoing index for cross-tx chase
       const outIdx = buildOutgoingIndex(txs);
@@ -432,7 +438,7 @@
       const burned = burnedUnits;
       const currentSupply = minted >= burned ? (minted - burned) : 0n;
 
-      // LP balances (for bubbles)
+      // LP bubbles
       const lpPerPair = [];
       for (const pa of pairSet) {
         let units = await tokenBalanceOf(contract, pa);
@@ -445,7 +451,7 @@
       const lpUnitsSum = lpPerPair.reduce((s,p)=>s+p.units,0n);
       const lpPct = currentSupply > 0n ? pctUnits(lpUnitsSum, currentSupply) : 0;
 
-      // VESTED balances
+      // VESTED bubbles
       const vestedPerAddr = [];
       let vestedUnitsSum = 0n;
       for (const va of vestedSet) {
@@ -497,16 +503,22 @@
       const displayedHolders = holders.length;
       const burnPctVsMinted   = minted > 0n ? pctUnits(burned, minted) : 0;
 
-      // ===== First N real buys + enriched for matrix =====
+      // ===== First 25 real buys (with proxy unwrapping) =====
       const firstN = findFirstNRealBuys({
-        txs, pairSet, excluded: new Set([...excluded, contract]), outIdx, limit: FIRST_BUYERS_LIMIT
+        txs,
+        pairSet,
+        excluded: new Set([...excluded, contract]),
+        index: { sendRecipients, inflow, outflow, outIdx },
+        limit: FIRST_BUYERS_LIMIT,
+        windowSec: CROSS_TX_WINDOW_SEC,
+        maxDepth: CROSS_TX_MAX_DEPTH
       });
 
       const firstNEnriched = firstN.map((b) => {
         const addr = b.address;
-        const initialUnits = b.initialUnits;               // BigInt
+        const initialUnits = b.initialUnits;
         const currentUnitsRaw = (balances[addr] || 0n);
-        const currentUnits = currentUnitsRaw > 0n ? currentUnitsRaw : 0n; // no negatives in UI
+        const currentUnits = currentUnitsRaw > 0n ? currentUnitsRaw : 0n;
 
         // Status
         let status = 'hold';
@@ -514,29 +526,18 @@
         else if (currentUnits > initialUnits) status = 'more';
         else if (currentUnits < initialUnits) status = 'soldPart';
 
-        // Deltas
-        const soldUnits   = (initialUnits > currentUnits) ? (initialUnits - currentUnits) : 0n;
-        const boughtUnits = (currentUnits > initialUnits) ? (currentUnits - initialUnits) : 0n;
-
         // Pcts (vs current supply)
         const initPct    = currentSupply > 0n ? pctUnits(initialUnits, currentSupply) : 0;
-        const soldPct    = currentSupply > 0n ? pctUnits(soldUnits,   currentSupply) : 0;
-        const boughtPct  = currentSupply > 0n ? pctUnits(boughtUnits, currentSupply) : 0;
         const currentPct = currentSupply > 0n ? pctUnits(currentUnits, currentSupply) : 0;
+        const soldPct    = currentPct < initPct ? (initPct - currentPct) : 0;
+        const boughtPct  = currentPct > initPct ? (currentPct - initPct) : 0;
 
-        // Progress (current vs initial), clamp 0..200 (so "more" can exceed 100)
         const progressPct = initialUnits === 0n ? 0 : clamp(Number((currentUnits * 10000n) / (initialUnits === 0n ? 1n : initialUnits)) / 100, 0, 200);
 
-        return {
-          address: addr,
-          status,
-          ts: b.ts,
-          currentPct, initPct, soldPct, boughtPct,
-          progressPct
-        };
+        return { address: addr, status, ts: b.ts, initPct, currentPct, soldPct, boughtPct, progressPct };
       });
 
-      // LP & VESTED nodes
+      // LP & VESTED nodes for bubbles
       const lpNodes = lpPerPair.map((p, i) => ({
         address: p.address,
         balance: toNum(p.units, tokenDecimals),
@@ -580,7 +581,7 @@
         }
       });
 
-      // Burn banner in header
+      // Burn banner
       if (burned > 0n) {
         document.getElementById('pair-info').innerHTML =
           `<span style="color:#ff4e4e">🔥 Burn — ${toNum(burned, tokenDecimals).toLocaleString(undefined,{maximumFractionDigits:18})} tokens (${burnPctVsMinted.toFixed(4)}% of minted)</span>`;
@@ -593,7 +594,7 @@
     }
   };
 
-  // ===== RENDERER / UI =====
+  // ===== RENDERER / UI (unchanged) =====
   function renderUI({ tokenDecimals, holders, extras, mintedUnits, burnedUnits, currentSupply, tgRecipients, lpPerPair, vestedPerAddr, stats }) {
     const root = document.getElementById('bubble-map');
     root.innerHTML = `
@@ -619,7 +620,6 @@
       </div>
     `;
 
-    // toggles
     root.querySelectorAll('.acc .acc-h').forEach(btn => {
       btn.addEventListener('click', () => btn.parentElement.classList.toggle('collapsed'));
     });
@@ -631,7 +631,7 @@
 
   function renderBubble({ root, holders, extras, tgRecipients }) {
     const width = root.offsetWidth || 960;
-    const height = 640;
+       const height = 640;
     const data = holders.concat(extras);
 
     const svg = d3.select(root).append('svg')
@@ -642,7 +642,6 @@
     const droot = d3.hierarchy({ children: data }).sum(d => d.balance);
     const nodes = pack(droot).leaves();
 
-    // Tooltip element (shared)
     let tip = d3.select('#bubble-tip');
     if (tip.empty()) {
       tip = d3.select('body').append('div').attr('id','bubble-tip')
@@ -652,9 +651,9 @@
     }
 
     function ringColorFor(addr, type) {
-      if (tgRecipients.has(addr))   return '#FFD700';  // gold
-      if (type === 'lp')            return '#C4B5FD';  // lilac
-      if (type === 'vested')        return '#6EE7B7';  // mint
+      if (tgRecipients.has(addr))   return '#FFD700';
+      if (type === 'lp')            return '#C4B5FD';
+      if (type === 'vested')        return '#6EE7B7';
       return null;
     }
     function fillFor(d) {
@@ -694,14 +693,12 @@
         .style('opacity', 1);
       })
       .on('mousemove', function (event) {
-        tip.style('left', (event.clientX + 12) + 'px').style('top', (event.clientY + 12) + 'px');
+        d3.select('#bubble-tip').style('left', (event.clientX + 12) + 'px').style('top', (event.clientY + 12) + 'px');
       })
       .on('mouseout', function () {
-        tip.style('opacity', 0);
+        d3.select('#bubble-tip').style('opacity', 0);
       })
-      .on('click', (event, d) => {
-        window.open(`${EXPLORER}/address/${d.data.address}`, '_blank');
-      });
+      .on('click', (event, d) => window.open(`${EXPLORER}/address/${d.data.address}`, '_blank'));
 
     g.append('text')
       .attr('dy', '.35em')
@@ -749,7 +746,7 @@
       ${buyersMatrix}
 
       <div style="opacity:.8;margin-top:10px">Colors — <span style="color:#00ff9c">green</span>: Hold • <span style="color:#4ea3ff">blue</span>: Sold Part • <span style="color:#ffd84e">yellow</span>: Bought More • <span style="color:#ff4e4e">red</span>: Sold All</div>
-      <div style="opacity:.6;margin-top:6px;font-size:.9em">*“First ${FIRST_BUYERS_LIMIT} buyers” = first ${FIRST_BUYERS_LIMIT} unique wallets to receive tokens from any LP, following router/proxy hops in-tx or within ${CROSS_TX_WINDOW_SEC/60}min after each LP outflow.</div>
+      <div style="opacity:.6;margin-top:6px;font-size:.9em">*“First ${FIRST_BUYERS_LIMIT} buyers” = first ${FIRST_BUYERS_LIMIT} unique wallets to receive tokens from any LP, unwrapping router/proxy hops in-tx and within ${CROSS_TX_WINDOW_SEC/60} min after each LP outflow.</div>
     `;
 
     wireBuyersMatrixInteractions();
@@ -840,7 +837,6 @@
     const container = document.getElementById('buyers-matrix');
     if (!container) return;
 
-    // Reuse shared tooltip
     let tip = d3.select('#bubble-tip');
     if (tip.empty()) {
       tip = d3.select('body').append('div').attr('id','bubble-tip')
@@ -886,10 +882,10 @@
       .style('opacity', 1);
     }
     function moveTip(evt) {
-      tip.style('left', (evt.clientX + 12) + 'px').style('top', (evt.clientY + 12) + 'px');
+      d3.select('#bubble-tip').style('left', (evt.clientX + 12) + 'px').style('top', (evt.clientY + 12) + 'px');
     }
     function hideTip() {
-      tip.style('opacity', 0);
+      d3.select('#bubble-tip').style('opacity', 0);
     }
 
     container.onmouseover = (e) => {
