@@ -1,7 +1,13 @@
-// /var/www/abs-proxy/abs-proxy.js
+// abs-proxy.js
 const express = require("express");
-const fetch = require("node-fetch");
 require("dotenv").config();
+
+// Use native fetch if available (Node 18+), otherwise fallback to node-fetch (Node 16)
+let fetchFn = global.fetch;
+if (!fetchFn) {
+  try { fetchFn = require("node-fetch"); }
+  catch { console.error("Install node-fetch or upgrade Node to v18+: `npm i node-fetch@2`"); process.exit(1); }
+}
 
 const app = express();
 const PORT = process.env.PORT || 8787;
@@ -12,7 +18,7 @@ if (!ABS_API_KEY) {
   console.error("ABS_API_KEY missing in .env"); process.exit(1);
 }
 
-app.get("/healthz", (_req, res) => res.send("ok"));
+app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
 app.get("/api/abs", async (req, res) => {
   try {
@@ -22,8 +28,11 @@ app.get("/api/abs", async (req, res) => {
     }
     url.searchParams.set("apikey", ABS_API_KEY);
 
-    const r = await fetch(url.toString(), { headers: { accept: "application/json" } });
-    res.setHeader("Cache-Control","public, max-age=0, s-maxage=30, stale-while-revalidate=60");
+    const r = await fetchFn(url.toString(), {
+      headers: { "accept": "application/json", "user-agent": "abs-proxy/1.0" }
+    });
+
+    res.setHeader("Cache-Control", "public, max-age=0, s-maxage=30, stale-while-revalidate=60");
     res.status(r.status).send(await r.text());
   } catch (e) {
     console.error(e);
@@ -31,4 +40,6 @@ app.get("/api/abs", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`ABS proxy on http://127.0.0.1:${PORT}/api/abs`));
+app.listen(PORT, () => {
+  console.log(`ABS proxy listening on http://127.0.0.1:${PORT}/api/abs`);
+});
